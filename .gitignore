@@ -1,0 +1,12 @@
+node_modules/
+dist/
+ui/node_modules/
+ui/dist/
+data/
+logs/
+.env
+*.db
+*.db-shm
+*.db-wal
+clean/
+.claude/

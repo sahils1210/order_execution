@@ -1,0 +1,89 @@
+import 'dotenv/config';
+import http from 'http';
+import express from 'express';
+import cors from 'cors';
+import path from 'path';
+import { config } from './config.js';
+import { logger } from './logger.js';
+import { initDb } from './db/database.js';
+import { kiteClient } from './kite/KiteClient.js';
+import { initWebSocket, emitTokenStatus } from './websocket.js';
+import { requireApiKey } from './middleware/auth.js';
+import { orderRouter } from './routes/order.js';
+import { ordersRouter } from './routes/orders.js';
+import { healthRouter } from './routes/health.js';
+
+async function main(): Promise<void> {
+  // ── 1. Database ──────────────────────────────────────────────────────────
+  initDb();
+
+  // ── 2. Kite Client ───────────────────────────────────────────────────────
+  await kiteClient.initialize();
+
+  // ── 3. Express App ───────────────────────────────────────────────────────
+  const app = express();
+
+  app.use(express.json({ limit: '16kb' }));
+  app.use(cors({
+    origin: config.corsOrigins,
+    methods: ['GET', 'POST'],
+    allowedHeaders: ['Content-Type', 'X-API-Key'],
+  }));
+  app.use((_req, res, next) => {
+    res.setHeader('Connection', 'keep-alive');
+    next();
+  });
+
+  // ── 4. API Routes ────────────────────────────────────────────────────────
+  app.use('/order', requireApiKey, orderRouter);
+  app.use('/orders', requireApiKey, ordersRouter);
+  app.use('/health', healthRouter);
+
+  // Token refresh endpoint — callable from UI button or curl
+  app.post('/refresh-token', requireApiKey, async (_req, res) => {
+    try {
+      await kiteClient.refreshToken();
+      const status = kiteClient.getTokenStatus();
+      res.json({ success: true, message: 'Token refreshed and validated', token: status });
+    } catch (err) {
+      const status = kiteClient.getTokenStatus();
+      res.status(500).json({ success: false, message: String(err), token: status });
+    }
+  });
+
+  // ── 5. UI Dashboard static files ─────────────────────────────────────────
+  const uiDist = path.join(process.cwd(), 'ui', 'dist');
+  app.use(express.static(uiDist));
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(uiDist, 'index.html'));
+  });
+
+  // ── 6. HTTP Server + WebSocket ───────────────────────────────────────────
+  const server = http.createServer(app);
+  server.on('connection', (socket) => { socket.setKeepAlive(true, 30_000); });
+
+  initWebSocket(server);
+
+  // Wire KiteClient to emit token status changes to UI in real-time
+  kiteClient.emitStatusUpdate = () => {
+    emitTokenStatus(kiteClient.getTokenStatus());
+  };
+
+  server.listen(config.port, () => {
+    logger.info('Order Gateway running', { port: config.port, env: config.nodeEnv });
+  });
+
+  // ── 7. Graceful shutdown ─────────────────────────────────────────────────
+  process.on('SIGTERM', () => shutdown(server));
+  process.on('SIGINT', () => shutdown(server));
+}
+
+function shutdown(server: http.Server): void {
+  logger.info('Shutting down...');
+  server.close(() => { logger.info('Server closed'); process.exit(0); });
+}
+
+main().catch((err) => {
+  logger.error('Fatal startup error', { error: String(err) });
+  process.exit(1);
+});
