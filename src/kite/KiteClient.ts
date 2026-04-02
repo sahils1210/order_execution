@@ -86,7 +86,7 @@ class KiteClient {
     const url = config.kite.tokenServiceUrl;
     if (!url) throw new Error('TOKEN_SERVICE_URL is not configured');
 
-    const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+    const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
     if (!res.ok) throw new Error(`Token service returned HTTP ${res.status}`);
 
     const body = await res.json() as {
