@@ -7,11 +7,13 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { initDb } from './db/database.js';
 import { kiteClient } from './kite/KiteClient.js';
+import { accountRegistry, parseAccountDefs } from './kite/AccountRegistry.js';
 import { initWebSocket, emitTokenStatus } from './websocket.js';
 import { requireApiKey } from './middleware/auth.js';
 import { orderRouter } from './routes/order.js';
 import { ordersRouter } from './routes/orders.js';
 import { healthRouter } from './routes/health.js';
+import { orderMultiRouter } from './routes/orderMulti.js';
 
 async function main(): Promise<void> {
   // ── 1. Database ──────────────────────────────────────────────────────────
@@ -19,6 +21,12 @@ async function main(): Promise<void> {
 
   // ── 2. Kite Client ───────────────────────────────────────────────────────
   await kiteClient.initialize();
+
+  // ── 2b. Multi-account registry (optional — skipped if ACCOUNTS_JSON not set)
+  const accountDefs = parseAccountDefs();
+  if (accountDefs.length > 0) {
+    await accountRegistry.initialize(accountDefs);
+  }
 
   // ── 3. Express App ───────────────────────────────────────────────────────
   const app = express();
@@ -35,6 +43,7 @@ async function main(): Promise<void> {
   });
 
   // ── 4. API Routes ────────────────────────────────────────────────────────
+  app.use('/order/multi', requireApiKey, orderMultiRouter);
   app.use('/order', requireApiKey, orderRouter);
   app.use('/orders', requireApiKey, ordersRouter);
   app.use('/health', healthRouter);
