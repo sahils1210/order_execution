@@ -161,7 +161,11 @@ orderMultiRouter.post('/', async (req: Request, res: Response) => {
 
     } catch (err: unknown) {
       const latencyMs = Date.now() - start;
-      const error = String(err);
+      const error = err instanceof Error
+        ? err.message
+        : typeof err === 'object' && err !== null
+          ? ((err as any).message ?? JSON.stringify(err))
+          : String(err);
 
       logger.error('Multi-account order failed', {
         account: accountId,

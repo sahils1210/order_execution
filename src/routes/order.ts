@@ -98,7 +98,11 @@ orderRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       kiteOrderId,
     });
   } catch (err: unknown) {
-    errorMessage = String(err);
+    errorMessage = err instanceof Error
+      ? err.message
+      : typeof err === 'object' && err !== null
+        ? ((err as any).message ?? JSON.stringify(err))
+        : String(err);
     logger.error('Order placement failed', {
       idempotencyKey,
       source: body.source,
