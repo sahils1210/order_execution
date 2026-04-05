@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { kiteClient } from '../kite/KiteClient.js';
-import { insertOrderLog, updateOrderLog, findByIdempotencyKey } from '../db/database.js';
+import { atomicCheckAndInsert, updateOrderLog } from '../db/database.js';
 import { setIdempotencyCache, getIdempotencyCache } from '../utils/idempotency.js';
 import { logger } from '../logger.js';
 import { emitOrderUpdate } from '../websocket.js';
@@ -25,67 +25,57 @@ orderRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
   const { idempotencyKey } = body;
 
-  // ── 2. Idempotency: check DB first (survives restart) ────────────────────
-  const existing = findByIdempotencyKey(idempotencyKey);
+  // ── 2+3+4. Atomic idempotency gate ──────────────────────────────────────
+  // INSERT OR IGNORE is the single atomic gate. No separate SELECT+INSERT race.
+  // Returns the existing record if the key was already seen; null if freshly inserted.
+  const existing = atomicCheckAndInsert({
+    idempotencyKey,
+    source: body.source,
+    exchange: body.exchange,
+    tradingsymbol: body.tradingsymbol,
+    transactionType: body.transactionType,
+    quantity: body.quantity,
+    product: body.product,
+    orderType: body.orderType,
+    variety: body.variety ?? 'regular',
+    price: body.price ?? null,
+    triggerPrice: body.triggerPrice ?? null,
+    tag: body.tag ?? null,
+  });
+
   if (existing) {
-    logger.info('Idempotency: returning cached result from DB', {
-      idempotencyKey,
-      status: existing.status,
-      kiteOrderId: existing.kiteOrderId,
-    });
-    const response: OrderResponse = {
-      success: existing.status === 'COMPLETE' || existing.status === 'SENT',
-      orderId: existing.kiteOrderId ?? undefined,
-      message: `Duplicate request — status: ${existing.status}`,
-      latencyMs: 0,
-    };
-    res.status(200).json(response);
-    return;
-  }
-
-  // ── 3. Idempotency: check in-memory (in-flight protection) ───────────────
-  const inFlight = getIdempotencyCache(idempotencyKey);
-  if (inFlight) {
-    logger.warn('Idempotency: request is already in-flight', { idempotencyKey });
-    res.status(409).json({
-      success: false,
-      message: 'Order with this idempotencyKey is currently being processed. Retry in a moment.',
-      latencyMs: 0,
-    });
-    return;
-  }
-
-  // ── 4. Insert log record + mark in-flight ────────────────────────────────
-  try {
-    insertOrderLog({
-      idempotencyKey,
-      source: body.source,
-      exchange: body.exchange,
-      tradingsymbol: body.tradingsymbol,
-      transactionType: body.transactionType,
-      quantity: body.quantity,
-      product: body.product,
-      orderType: body.orderType,
-      variety: body.variety ?? 'regular',
-      price: body.price ?? null,
-      triggerPrice: body.triggerPrice ?? null,
-      tag: body.tag ?? null,
-    });
-  } catch (err: unknown) {
-    // UNIQUE constraint violation = duplicate key arrived simultaneously
-    if (String(err).includes('UNIQUE')) {
-      logger.warn('Idempotency: concurrent duplicate detected via DB constraint', { idempotencyKey });
+    // Check in-memory cache first — if still in-flight, tell caller to retry
+    const inFlight = getIdempotencyCache(idempotencyKey);
+    if (inFlight === null && existing.status === 'RECEIVED') {
+      // DB says RECEIVED but no cache entry → previous attempt crashed mid-flight
+      // Fall through: treat as if never placed (status will be updated below)
+      logger.warn('Idempotency: found RECEIVED record with no cache — previous attempt may have crashed', { idempotencyKey });
+    } else if (inFlight !== undefined) {
+      logger.warn('Idempotency: request is already in-flight', { idempotencyKey });
       res.status(409).json({
         success: false,
-        message: 'Duplicate idempotencyKey — concurrent request detected.',
+        message: 'Order with this idempotencyKey is currently being processed. Retry in a moment.',
         latencyMs: 0,
       });
       return;
+    } else {
+      logger.info('Idempotency: returning cached result from DB', {
+        idempotencyKey,
+        status: existing.status,
+        kiteOrderId: existing.kiteOrderId,
+      });
+      const response: OrderResponse = {
+        success: existing.status === 'COMPLETE' || existing.status === 'SENT',
+        orderId: existing.kiteOrderId ?? undefined,
+        message: `Duplicate request — status: ${existing.status}`,
+        latencyMs: 0,
+      };
+      res.status(200).json(response);
+      return;
     }
-    throw err;
   }
 
-  // Mark in-flight (prevents duplicate in-process requests)
+  // Mark in-flight (fast in-process guard for concurrent requests on same process)
   setIdempotencyCache(idempotencyKey, null, 'IN_FLIGHT');
 
   // ── 5. Execute order via Kite ─────────────────────────────────────────────

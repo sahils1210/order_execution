@@ -221,6 +221,69 @@ class KiteClient {
     }
   }
 
+  // ─── Order Cancellation ────────────────────────────────────────────────────
+
+  async cancelOrder(orderId: string, variety = 'regular'): Promise<string> {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await Promise.race([
+        (this.kite as any).cancelOrder(variety, orderId),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Kite API timeout')), config.kite.timeoutMs)
+        ),
+      ]);
+      return (result as { order_id: string }).order_id;
+    } catch (err: unknown) {
+      const errStr = String(err);
+      if (this.isTokenError(errStr)) {
+        logger.warn('Token error during cancelOrder — refreshing and retrying');
+        await this.fetchAndSetToken('cancel-token-error');
+        this.emitStatusUpdate();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const retry = await (this.kite as any).cancelOrder(variety, orderId);
+        return (retry as { order_id: string }).order_id;
+      }
+      throw err;
+    }
+  }
+
+  // ─── Order Modification ────────────────────────────────────────────────────
+
+  async modifyOrder(orderId: string, params: {
+    price?: number;
+    triggerPrice?: number;
+    quantity?: number;
+    orderType?: string;
+  }, variety = 'regular'): Promise<string> {
+    const modifyParams: Record<string, unknown> = {};
+    if (params.price != null) modifyParams.price = params.price;
+    if (params.triggerPrice != null) modifyParams.trigger_price = params.triggerPrice;
+    if (params.quantity != null) modifyParams.quantity = params.quantity;
+    if (params.orderType != null) modifyParams.order_type = params.orderType;
+
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const result = await Promise.race([
+        (this.kite as any).modifyOrder(variety, orderId, modifyParams),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Kite API timeout')), config.kite.timeoutMs)
+        ),
+      ]);
+      return (result as { order_id: string }).order_id;
+    } catch (err: unknown) {
+      const errStr = String(err);
+      if (this.isTokenError(errStr)) {
+        logger.warn('Token error during modifyOrder — refreshing and retrying');
+        await this.fetchAndSetToken('modify-token-error');
+        this.emitStatusUpdate();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const retry = await (this.kite as any).modifyOrder(variety, orderId, modifyParams);
+        return (retry as { order_id: string }).order_id;
+      }
+      throw err;
+    }
+  }
+
   // ─── Health & Status ───────────────────────────────────────────────────────
 
   async isHealthy(): Promise<boolean> {

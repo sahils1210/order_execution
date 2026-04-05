@@ -10,3 +10,5 @@ logs/
 *.db-wal
 clean/
 .claude/
+droplet_key
+droplet_key.pub

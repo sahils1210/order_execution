@@ -174,6 +174,65 @@ export function findByIdempotencyKey(key: string): OrderLog | null {
   return row ? rowToOrderLog(row) : null;
 }
 
+/**
+ * Atomically check for an existing record and insert if none exists.
+ *
+ * Uses INSERT OR IGNORE so that:
+ *   - If the key is new   → inserts, returns null  (caller must place the order)
+ *   - If the key exists   → no-ops, returns the existing record (caller must return cached response)
+ *
+ * Because DatabaseSync executes synchronously on the Node.js event loop, the
+ * INSERT OR IGNORE is the single atomic gate that prevents concurrent duplicates.
+ * No separate SELECT + INSERT race is possible within Node's single-threaded model.
+ */
+export function atomicCheckAndInsert(params: {
+  idempotencyKey: string;
+  source: string;
+  exchange: string;
+  tradingsymbol: string;
+  transactionType: string;
+  quantity: number;
+  product: string;
+  orderType: string;
+  variety: string;
+  price: number | null;
+  triggerPrice: number | null;
+  tag: string | null;
+}): OrderLog | null {
+  // INSERT OR IGNORE: silently skips if idempotency_key already exists
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO order_logs (
+      idempotency_key, source, exchange, tradingsymbol, transaction_type,
+      quantity, product, order_type, variety, price, trigger_price, tag,
+      status, received_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
+  `);
+
+  const result = insert.run(
+    params.idempotencyKey,
+    params.source,
+    params.exchange,
+    params.tradingsymbol,
+    params.transactionType,
+    params.quantity,
+    params.product,
+    params.orderType,
+    params.variety,
+    params.price,
+    params.triggerPrice,
+    params.tag,
+    new Date().toISOString()
+  );
+
+  if ((result as any).changes === 0) {
+    // Row already existed — return it so caller can respond with cached result
+    return findByIdempotencyKey(params.idempotencyKey);
+  }
+
+  // Fresh insert — caller must proceed to place the order
+  return null;
+}
+
 function rowToOrderLog(row: Record<string, unknown>): OrderLog {
   return {
     id: row.id as number,

@@ -11,6 +11,7 @@ import { accountRegistry, parseAccountDefs } from './kite/AccountRegistry.js';
 import { initWebSocket, emitTokenStatus } from './websocket.js';
 import { requireApiKey } from './middleware/auth.js';
 import { orderRouter } from './routes/order.js';
+import { orderActionsRouter } from './routes/orderActions.js';
 import { ordersRouter } from './routes/orders.js';
 import { healthRouter } from './routes/health.js';
 import { orderMultiRouter } from './routes/orderMulti.js';
@@ -34,7 +35,7 @@ async function main(): Promise<void> {
   app.use(express.json({ limit: '16kb' }));
   app.use(cors({
     origin: config.corsOrigins,
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'X-API-Key'],
   }));
   app.use((_req, res, next) => {
@@ -44,7 +45,8 @@ async function main(): Promise<void> {
 
   // ── 4. API Routes ────────────────────────────────────────────────────────
   app.use('/order/multi', requireApiKey, orderMultiRouter);
-  app.use('/order', requireApiKey, orderRouter);
+  app.use('/order', requireApiKey, orderActionsRouter); // DELETE /:id, PATCH /:id
+  app.use('/order', requireApiKey, orderRouter);        // POST /
   app.use('/orders', requireApiKey, ordersRouter);
   app.use('/health', healthRouter);
 
