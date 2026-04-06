@@ -233,6 +233,22 @@ export function atomicCheckAndInsert(params: {
   return null;
 }
 
+/**
+ * Delete all orders from previous days (before today 00:00 IST).
+ * Called daily at 09:00 IST to keep the order log fresh for each trading day.
+ */
+export function clearPreviousDayOrders(): number {
+  // IST = UTC+5:30 → today 00:00 IST = yesterday 18:30 UTC
+  const now = new Date();
+  const istOffset = 5.5 * 60 * 60 * 1000;
+  const istMidnight = new Date(now.getTime() + istOffset);
+  istMidnight.setUTCHours(0, 0, 0, 0);
+  const cutoffUtc = new Date(istMidnight.getTime() - istOffset);
+
+  const result = db.prepare('DELETE FROM order_logs WHERE received_at < ?').run(cutoffUtc.toISOString());
+  return (result as any).changes ?? 0;
+}
+
 function rowToOrderLog(row: Record<string, unknown>): OrderLog {
   return {
     id: row.id as number,

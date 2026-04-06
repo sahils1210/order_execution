@@ -16,6 +16,11 @@ function App() {
   }, []);
 
   const handleApply = () => fetchOrders(filters);
+  const handleClear = () => {
+    const cleared: Filters = { source: '', status: '', from: '', to: '' };
+    setFilters(cleared);
+    fetchOrders(cleared);
+  };
 
   const totalToday = orders.length;
   const sentCount   = orders.filter((o) => o.status === 'SENT' || o.status === 'COMPLETE').length;
@@ -122,7 +127,7 @@ function App() {
         </div>
 
         {/* ── Filters ── */}
-        <FilterBar filters={filters} onChange={setFilters} onApply={handleApply} />
+        <FilterBar filters={filters} onChange={setFilters} onApply={handleApply} onClear={handleClear} />
 
         {/* ── Order Table ── */}
         <div className="bg-gray-900 border border-gray-800 rounded-lg overflow-hidden">

@@ -5,9 +5,10 @@ interface FiltersProps {
   filters: Filters;
   onChange: (f: Filters) => void;
   onApply: () => void;
+  onClear: () => void;
 }
 
-export function FilterBar({ filters, onChange, onApply }: FiltersProps) {
+export function FilterBar({ filters, onChange, onApply, onClear }: FiltersProps) {
   const set = (key: keyof Filters, val: string) => onChange({ ...filters, [key]: val });
 
   return (
@@ -73,10 +74,7 @@ export function FilterBar({ filters, onChange, onApply }: FiltersProps) {
       </button>
 
       <button
-        onClick={() => {
-          onChange({ source: '', status: '', from: '', to: '' });
-          setTimeout(onApply, 0);
-        }}
+        onClick={onClear}
         className="px-4 py-1.5 bg-gray-700 hover:bg-gray-600 text-gray-300 text-sm rounded transition-colors"
       >
         Clear

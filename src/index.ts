@@ -5,7 +5,7 @@ import cors from 'cors';
 import path from 'path';
 import { config } from './config.js';
 import { logger } from './logger.js';
-import { initDb } from './db/database.js';
+import { initDb, clearPreviousDayOrders } from './db/database.js';
 import { kiteClient } from './kite/KiteClient.js';
 import { accountRegistry, parseAccountDefs } from './kite/AccountRegistry.js';
 import { initWebSocket, emitTokenStatus } from './websocket.js';
@@ -84,9 +84,32 @@ async function main(): Promise<void> {
     logger.info('Order Gateway running', { port: config.port, env: config.nodeEnv });
   });
 
-  // ── 7. Graceful shutdown ─────────────────────────────────────────────────
+  // ── 7. Daily order log cleanup at 09:00 IST ─────────────────────────────
+  scheduleDailyCleanup();
+
+  // ── 8. Graceful shutdown ─────────────────────────────────────────────────
   process.on('SIGTERM', () => shutdown(server));
   process.on('SIGINT', () => shutdown(server));
+}
+
+function scheduleDailyCleanup(): void {
+  const schedule = () => {
+    const now = new Date();
+    // 09:00 IST = 03:30 UTC
+    const target = new Date(now);
+    target.setUTCHours(3, 30, 0, 0);
+    if (target <= now) target.setUTCDate(target.getUTCDate() + 1);
+
+    const ms = target.getTime() - now.getTime();
+    setTimeout(() => {
+      const deleted = clearPreviousDayOrders();
+      logger.info('Daily order log cleanup', { deletedRows: deleted });
+      schedule(); // schedule next day
+    }, ms);
+
+    logger.info('Daily order cleanup scheduled', { atIST: '09:00', inHours: +(ms / 3600000).toFixed(1) });
+  };
+  schedule();
 }
 
 function shutdown(server: http.Server): void {
