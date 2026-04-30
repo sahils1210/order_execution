@@ -5,7 +5,7 @@ import cors from 'cors';
 import path from 'path';
 import { config } from './config.js';
 import { logger } from './logger.js';
-import { initDb, clearPreviousDayOrders } from './db/database.js';
+import { initDb } from './db/database.js';
 import { kiteClient } from './kite/KiteClient.js';
 import { accountRegistry, parseAccountDefs } from './kite/AccountRegistry.js';
 import { initWebSocket, emitTokenStatus } from './websocket.js';
@@ -13,24 +13,28 @@ import { requireApiKey } from './middleware/auth.js';
 import { orderRouter } from './routes/order.js';
 import { orderActionsRouter } from './routes/orderActions.js';
 import { ordersRouter } from './routes/orders.js';
-import { healthRouter } from './routes/health.js';
+import { healthLiveRouter, healthFullRouter } from './routes/health.js';
 import { orderMultiRouter } from './routes/orderMulti.js';
+import { adminRouter } from './routes/admin.js';
+import { webhookRouter } from './routes/webhook.js';
+import { killSwitch } from './risk/KillSwitch.js';
+import { reconciler } from './oms/Reconciler.js';
+import { alertAsync } from './alerts/Telegram.js';
 
 async function main(): Promise<void> {
-  // ── 1. Database ──────────────────────────────────────────────────────────
   initDb();
-
-  // ── 2. Kite Client ───────────────────────────────────────────────────────
+  killSwitch.initialize();
   await kiteClient.initialize();
 
-  // ── 2b. Multi-account registry (optional — skipped if ACCOUNTS_JSON not set)
   const accountDefs = parseAccountDefs();
   if (accountDefs.length > 0) {
     await accountRegistry.initialize(accountDefs);
   }
 
-  // ── 3. Express App ───────────────────────────────────────────────────────
   const app = express();
+
+  // Webhook is mounted FIRST so it bypasses the global JSON parser and auth.
+  app.use('/webhook', webhookRouter);
 
   app.use(express.json({ limit: '16kb' }));
   app.use(cors({
@@ -38,19 +42,20 @@ async function main(): Promise<void> {
     methods: ['GET', 'POST', 'DELETE', 'PATCH'],
     allowedHeaders: ['Content-Type', 'X-API-Key'],
   }));
-  app.use((_req, res, next) => {
-    res.setHeader('Connection', 'keep-alive');
-    next();
-  });
 
-  // ── 4. API Routes ────────────────────────────────────────────────────────
+  // ── Health endpoints ────────────────────────────────────────────────────
+  // /health/live is PUBLIC — for load balancers / external monitors.
+  // /health/full is PROTECTED — full state, requires X-API-Key.
+  app.use('/health/live',                  healthLiveRouter);
+  app.use('/health/full', requireApiKey,   healthFullRouter);
+
+  // ── Authenticated API routes ────────────────────────────────────────────
   app.use('/order/multi', requireApiKey, orderMultiRouter);
-  app.use('/order', requireApiKey, orderActionsRouter); // DELETE /:id, PATCH /:id
-  app.use('/order', requireApiKey, orderRouter);        // POST /
-  app.use('/orders', requireApiKey, ordersRouter);
-  app.use('/health', healthRouter);
+  app.use('/order',       requireApiKey, orderActionsRouter); // DELETE/PATCH /:id
+  app.use('/order',       requireApiKey, orderRouter);        // POST /
+  app.use('/orders',      requireApiKey, ordersRouter);
+  app.use('/admin',       requireApiKey, adminRouter);
 
-  // Token refresh endpoint — callable from UI button or curl
   app.post('/refresh-token', requireApiKey, async (_req, res) => {
     try {
       await kiteClient.refreshToken();
@@ -62,20 +67,23 @@ async function main(): Promise<void> {
     }
   });
 
-  // ── 5. UI Dashboard static files ─────────────────────────────────────────
+  // ── UI dashboard — only return SPA shell for non-API paths ──────────────
   const uiDist = path.join(process.cwd(), 'ui', 'dist');
   app.use(express.static(uiDist));
-  app.get('*', (_req, res) => {
-    res.sendFile(path.join(uiDist, 'index.html'));
+  const apiPrefixes = ['/order', '/orders', '/admin', '/health', '/refresh-token', '/webhook'];
+  app.get('*', (req, res, next) => {
+    if (apiPrefixes.some((p) => req.path === p || req.path.startsWith(`${p}/`))) {
+      res.status(404).json({ error: 'Not found', path: req.path });
+      return;
+    }
+    res.sendFile(path.join(uiDist, 'index.html'), (err) => err ? next(err) : undefined);
   });
 
-  // ── 6. HTTP Server + WebSocket ───────────────────────────────────────────
+  // ── HTTP + WebSocket ────────────────────────────────────────────────────
   const server = http.createServer(app);
   server.on('connection', (socket) => { socket.setKeepAlive(true, 30_000); });
-
   initWebSocket(server);
 
-  // Wire KiteClient to emit token status changes to UI in real-time
   kiteClient.emitStatusUpdate = () => {
     emitTokenStatus(kiteClient.getTokenStatus());
   };
@@ -84,40 +92,41 @@ async function main(): Promise<void> {
     logger.info('Order Gateway running', { port: config.port, env: config.nodeEnv });
   });
 
-  // ── 7. Daily order log cleanup at 09:00 IST ─────────────────────────────
-  scheduleDailyCleanup();
+  // ── Reconciler ──────────────────────────────────────────────────────────
+  reconciler.reconcileOnStartup()
+    .catch((err) => logger.error('Startup reconcile failed', { error: String(err) }))
+    .finally(() => reconciler.start());
 
-  // ── 8. Graceful shutdown ─────────────────────────────────────────────────
-  process.on('SIGTERM', () => shutdown(server));
-  process.on('SIGINT', () => shutdown(server));
-}
-
-function scheduleDailyCleanup(): void {
-  const schedule = () => {
-    const now = new Date();
-    // 09:00 IST = 03:30 UTC
-    const target = new Date(now);
-    target.setUTCHours(3, 30, 0, 0);
-    if (target <= now) target.setUTCDate(target.getUTCDate() + 1);
-
-    const ms = target.getTime() - now.getTime();
-    setTimeout(() => {
-      const deleted = clearPreviousDayOrders();
-      logger.info('Daily order log cleanup', { deletedRows: deleted });
-      schedule(); // schedule next day
-    }, ms);
-
-    logger.info('Daily order cleanup scheduled', { atIST: '09:00', inHours: +(ms / 3600000).toFixed(1) });
+  // ── Graceful shutdown ───────────────────────────────────────────────────
+  const shutdown = (sig: string) => {
+    logger.info('Shutdown signal received', { sig });
+    reconciler.stop();
+    server.close(() => {
+      logger.info('Server closed');
+      process.exit(0);
+    });
+    setTimeout(() => process.exit(0), 8000).unref();
   };
-  schedule();
-}
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT',  () => shutdown('SIGINT'));
 
-function shutdown(server: http.Server): void {
-  logger.info('Shutting down...');
-  server.close(() => { logger.info('Server closed'); process.exit(0); });
+  process.on('unhandledRejection', (reason) => {
+    const msg = String(reason);
+    logger.error('UNHANDLED REJECTION', { reason: msg });
+    alertAsync('critical', 'Unhandled promise rejection', msg);
+  });
+  process.on('uncaughtException', (err) => {
+    const stack = err.stack ?? String(err);
+    logger.error('UNCAUGHT EXCEPTION', { error: String(err), stack });
+    alertAsync('critical', 'Uncaught exception — process will exit', stack);
+    // Let the process exit; PM2 restarts.
+    setTimeout(() => process.exit(1), 500).unref();
+  });
 }
 
 main().catch((err) => {
-  logger.error('Fatal startup error', { error: String(err) });
+  const stack = err instanceof Error ? err.stack ?? String(err) : String(err);
+  logger.error('Fatal startup error', { error: stack });
+  alertAsync('critical', 'Gateway failed to start', stack);
   process.exit(1);
 });

@@ -1,71 +1,40 @@
 import { Router, Request, Response } from 'express';
+import { orderManager } from '../oms/OrderManager.js';
 import { accountRegistry } from '../kite/AccountRegistry.js';
-import { kiteClient } from '../kite/KiteClient.js';
 import { logger } from '../logger.js';
+import type { OrderRequest, OrderStatus } from '../types.js';
 
-// ─────────────────────────────────────────────────────────────────────────────
+// =========================================
 // POST /order/multi
 //
-// Execute one order across multiple accounts in parallel.
-// One account failure never blocks others.
+// Execute the SAME logical order across multiple accounts in parallel.
 //
-// Request body:
-//   {
-//     idempotencyKey: string,       // unique UUID — deduplicated per account
-//     source: string,
-//     accounts: string[],           // ["master", "huf"] — must be registered
-//     exchange: string,
-//     tradingsymbol: string,
-//     transactionType: "BUY"|"SELL",
-//     quantity: number,
-//     product: string,
-//     orderType: string,
-//     variety?: string,
-//     price?: number,
-//     triggerPrice?: number,
-//     tag?: string
-//   }
-//
-// Response:
-//   {
-//     results: {
-//       master: { success: true,  orderId: "12345", latencyMs: 87 },
-//       huf:    { success: false, error: "Token invalid", latencyMs: 120 }
-//     }
-//   }
-// ─────────────────────────────────────────────────────────────────────────────
+// Idempotency is per-account: each (idempotencyKey, accountId) is its own row
+// in the DB and gets its own stable `tag`. Retrying the request returns cached
+// results per account — no follower duplicates.
+// =========================================
 
 export const orderMultiRouter = Router();
 
-interface MultiOrderRequest {
-  idempotencyKey: string;
-  source: string;
+interface MultiOrderRequest extends OrderRequest {
   accounts: string[];
-  exchange: string;
-  tradingsymbol: string;
-  transactionType: 'BUY' | 'SELL';
-  quantity: number;
-  product: string;
-  orderType: string;
-  variety?: string;
-  price?: number;
-  triggerPrice?: number;
-  tag?: string;
 }
 
 interface AccountResult {
   success: boolean;
+  status: OrderStatus | null;
   orderId?: string;
   error?: string;
   latencyMs: number;
+  cached: boolean;
 }
 
-orderMultiRouter.post('/', async (req: Request, res: Response) => {
+orderMultiRouter.post('/', async (req: Request, res: Response): Promise<void> => {
   const body = req.body as MultiOrderRequest;
 
-  // ── Validate required fields ──────────────────────────────────────────────
   const missing: string[] = [];
-  for (const f of ['idempotencyKey', 'source', 'accounts', 'exchange', 'tradingsymbol', 'transactionType', 'quantity', 'product', 'orderType']) {
+  for (const f of ['idempotencyKey', 'source', 'accounts', 'exchange', 'tradingsymbol',
+                   'transactionType', 'quantity', 'product', 'orderType']) {
     if (body[f as keyof MultiOrderRequest] == null) missing.push(f);
   }
   if (missing.length > 0) {
@@ -78,10 +47,9 @@ orderMultiRouter.post('/', async (req: Request, res: Response) => {
     return;
   }
 
-  // ── Validate requested accounts exist ─────────────────────────────────────
-  const unknown = body.accounts.filter(
-    (id) => id !== 'master' && !accountRegistry.getAccountIds().includes(id)
-  );
+  // Validate accounts exist (master is always implicit)
+  const known = new Set<string>(['master', ...accountRegistry.getAccountIds()]);
+  const unknown = body.accounts.filter((id) => !known.has(id));
   if (unknown.length > 0) {
     res.status(400).json({ error: `Unknown account IDs: ${unknown.join(', ')}` });
     return;
@@ -96,101 +64,32 @@ orderMultiRouter.post('/', async (req: Request, res: Response) => {
     source: body.source,
   });
 
-  // ── Execute per-account in parallel ──────────────────────────────────────
-  const executions = body.accounts.map(async (accountId): Promise<[string, AccountResult]> => {
-    const start = Date.now();
-
-    try {
-      let orderId: string;
-
-      if (accountId === 'master') {
-        // Master uses the existing KiteClient (token refresh, retry logic, etc.)
-        orderId = await kiteClient.placeOrder({
-          idempotencyKey: body.idempotencyKey,
-          source: body.source,
-          exchange: body.exchange as any,
-          tradingsymbol: body.tradingsymbol,
-          transactionType: body.transactionType,
-          quantity: body.quantity,
-          product: body.product as any,
-          orderType: body.orderType as any,
-          variety: body.variety as any,
-          price: body.price,
-          triggerPrice: body.triggerPrice,
-          tag: body.tag,
-        });
-      } else {
-        // Additional accounts use AccountRegistry
-        const kite = accountRegistry.getKite(accountId);
-        if (!kite) throw new Error(`Account ${accountId} not found in registry`);
-        if (!accountRegistry.isValid(accountId)) throw new Error(`Account ${accountId} has invalid token`);
-
-        const variety = body.variety ?? 'regular';
-        const params: Record<string, unknown> = {
-          exchange: body.exchange,
-          tradingsymbol: body.tradingsymbol,
-          transaction_type: body.transactionType,
-          quantity: body.quantity,
-          product: body.product,
-          order_type: body.orderType,
-          ...(body.price != null && { price: body.price }),
-          ...(body.triggerPrice != null && { trigger_price: body.triggerPrice }),
-          ...(body.tag && { tag: body.tag }),
-        };
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result = await Promise.race([
-          (kite as any).placeOrder(variety, params),
-          new Promise<never>((_, reject) =>
-            setTimeout(() => reject(new Error('Kite API timeout')), 10000)
-          ),
-        ]);
-        orderId = (result as { order_id: string }).order_id;
-      }
-
-      const latencyMs = Date.now() - start;
-
-      logger.info('Multi-account order placed', {
-        account: accountId,
-        orderId,
-        symbol: body.tradingsymbol,
-        latencyMs,
-      });
-
-      return [accountId, { success: true, orderId, latencyMs }];
-
-    } catch (err: unknown) {
-      const latencyMs = Date.now() - start;
-      const error = err instanceof Error
-        ? err.message
-        : typeof err === 'object' && err !== null
-          ? ((err as any).message ?? JSON.stringify(err))
-          : String(err);
-
-      logger.error('Multi-account order failed', {
-        account: accountId,
-        symbol: body.tradingsymbol,
-        error,
-        latencyMs,
-      });
-
-      return [accountId, { success: false, error, latencyMs }];
-    }
+  // Place per-account, in parallel. Each account placement is fully idempotent.
+  const placements = body.accounts.map(async (accountId): Promise<[string, AccountResult]> => {
+    const r = await orderManager.placeOrder(body, accountId);
+    return [accountId, {
+      success: r.success,
+      status: r.status,
+      orderId: r.orderId ?? undefined,
+      error: r.error ?? undefined,
+      latencyMs: r.latencyMs,
+      cached: r.cached,
+    }];
   });
 
-  const settled = await Promise.allSettled(executions);
-
+  const settled = await Promise.allSettled(placements);
   const results: Record<string, AccountResult> = {};
   for (const s of settled) {
     if (s.status === 'fulfilled') {
       const [id, result] = s.value;
       results[id] = result;
     }
-    // allSettled on an async fn that catches internally — fulfilled always
+    // OrderManager.placeOrder catches internally and never throws — `rejected` shouldn't happen.
   }
 
-  const allFailed = Object.values(results).every((r) => !r.success);
-  const statusCode = allFailed ? 500 : 200;
+  // Summarise: 200 if at least one succeeded, 502 otherwise.
+  const anySuccess = Object.values(results).some((r) => r.success);
+  const statusCode = anySuccess ? 200 : 502;
 
   res.status(statusCode).json({ results });
 });

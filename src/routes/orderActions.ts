@@ -1,49 +1,51 @@
 import { Router, Request, Response } from 'express';
-import { kiteClient } from '../kite/KiteClient.js';
+import { orderManager } from '../oms/OrderManager.js';
 import { logger } from '../logger.js';
 
 // =========================================
-// DELETE /order/:orderId — Cancel an order
-// PATCH  /order/:orderId — Modify an order
+// DELETE /order/:orderId        — Cancel order (master account)
+// PATCH  /order/:orderId        — Modify order (master account)
+//
+// Multi-account cancel/modify is intentionally not exposed yet — the broker
+// order_id is account-specific and there is no use case in the current callers.
 // =========================================
 
 export const orderActionsRouter = Router();
 
-// ─── DELETE /order/:orderId ───────────────────────────────────────────────────
-
+// ─── DELETE /order/:orderId ─────────────────────────────────────────────────
 orderActionsRouter.delete('/:orderId', async (req: Request, res: Response): Promise<void> => {
-  const startMs = Date.now();
   const { orderId } = req.params;
   const variety = (req.query['variety'] as string | undefined) ?? 'regular';
+  const accountId = (req.query['account'] as string | undefined) ?? 'master';
 
   if (!orderId || typeof orderId !== 'string' || orderId.trim() === '') {
     res.status(400).json({ success: false, message: 'orderId path param is required', latencyMs: 0 });
     return;
   }
 
-  logger.info('Cancel order request', { orderId, variety });
+  logger.info('Cancel order request', { orderId, variety, accountId });
 
-  try {
-    const cancelledId = await kiteClient.cancelOrder(orderId.trim(), variety);
-    const latencyMs = Date.now() - startMs;
-
-    logger.info('Order cancelled', { orderId: cancelledId, latencyMs });
-
-    res.status(200).json({ success: true, orderId: cancelledId, latencyMs });
-  } catch (err: unknown) {
-    const latencyMs = Date.now() - startMs;
-    const message = String(err);
-    logger.error('Cancel order failed', { orderId, error: message, latencyMs });
-    res.status(502).json({ success: false, message, latencyMs });
+  const result = await orderManager.cancelOrder(orderId.trim(), variety, accountId);
+  if (result.success) {
+    res.status(200).json({
+      success: true,
+      orderId: result.orderId,
+      latencyMs: result.latencyMs,
+    });
+  } else {
+    res.status(502).json({
+      success: false,
+      message: result.error,
+      latencyMs: result.latencyMs,
+    });
   }
 });
 
-// ─── PATCH /order/:orderId ────────────────────────────────────────────────────
-
+// ─── PATCH /order/:orderId ──────────────────────────────────────────────────
 orderActionsRouter.patch('/:orderId', async (req: Request, res: Response): Promise<void> => {
-  const startMs = Date.now();
   const { orderId } = req.params;
   const variety = (req.query['variety'] as string | undefined) ?? 'regular';
+  const accountId = (req.query['account'] as string | undefined) ?? 'master';
 
   if (!orderId || typeof orderId !== 'string' || orderId.trim() === '') {
     res.status(400).json({ success: false, message: 'orderId path param is required', latencyMs: 0 });
@@ -66,23 +68,26 @@ orderActionsRouter.patch('/:orderId', async (req: Request, res: Response): Promi
     return;
   }
 
-  logger.info('Modify order request', { orderId, variety, price, triggerPrice, quantity, orderType });
+  logger.info('Modify order request', { orderId, variety, accountId, price, triggerPrice, quantity, orderType });
 
-  try {
-    const modifiedId = await kiteClient.modifyOrder(
-      orderId.trim(),
-      { price, triggerPrice, quantity, orderType },
-      variety
-    );
-    const latencyMs = Date.now() - startMs;
+  const result = await orderManager.modifyOrder(
+    orderId.trim(),
+    variety,
+    { price, triggerPrice, quantity, orderType },
+    accountId,
+  );
 
-    logger.info('Order modified', { orderId: modifiedId, latencyMs });
-
-    res.status(200).json({ success: true, orderId: modifiedId, latencyMs });
-  } catch (err: unknown) {
-    const latencyMs = Date.now() - startMs;
-    const message = String(err);
-    logger.error('Modify order failed', { orderId, error: message, latencyMs });
-    res.status(502).json({ success: false, message, latencyMs });
+  if (result.success) {
+    res.status(200).json({
+      success: true,
+      orderId: result.orderId,
+      latencyMs: result.latencyMs,
+    });
+  } else {
+    res.status(502).json({
+      success: false,
+      message: result.error,
+      latencyMs: result.latencyMs,
+    });
   }
 });
