@@ -17,6 +17,7 @@ import { killSwitch, autoHaltMonitor } from '../risk/KillSwitch.js';
 import { circuitBreaker } from '../risk/CircuitBreaker.js';
 import { preTradeCheck } from '../risk/PreTradeCheck.js';
 import { emitOrderUpdate } from '../websocket.js';
+import { runtimeMetrics } from '../observability/runtimeMetrics.js';
 import type { OrderRequest, OrderStatus } from '../types.js';
 
 // =========================================
@@ -129,9 +130,11 @@ class OrderManager {
       finalStatus = 'ACCEPTED';
       circuitBreaker.recordSuccess(req.source, req.tradingsymbol);
       autoHaltMonitor.recordSuccess();
+      runtimeMetrics.recordKiteCallSuccess();
     } catch (err) {
       const c = classifyKiteError(err);
       errorMessage = `[${c.kind}] ${c.message}`;
+      runtimeMetrics.recordKiteCallError(`${c.kind}: ${c.message}`);
 
       if (c.kind === 'TIMEOUT' || c.kind === 'MIDFLIGHT_RESET') {
         finalStatus = 'UNKNOWN';
@@ -150,6 +153,7 @@ class OrderManager {
     }
 
     const latencyMs = Date.now() - startMs;
+    runtimeMetrics.recordPlaceLatency(latencyMs);
 
     // Postback-race guard
     const current = findByCompositeKey(compositeKey);
@@ -310,13 +314,23 @@ class OrderManager {
     compositeKey: string,
   ): Promise<string> {
     const attempt = async (): Promise<string> => {
+      const queueStart = Date.now();
       await bucketFor(accountId).acquire();
-      return this.callWithTimeout(
-        () => callRaw(kite, 'placeOrder', variety, params),
-        config.kite.timeoutMs,
-        tag,
-        compositeKey,
-      );
+      runtimeMetrics.recordQueueWait(Date.now() - queueStart);
+      const kiteStart = Date.now();
+      try {
+        const id = await this.callWithTimeout(
+          () => callRaw(kite, 'placeOrder', variety, params),
+          config.kite.timeoutMs,
+          tag,
+          compositeKey,
+        );
+        runtimeMetrics.recordKiteLatency(Date.now() - kiteStart);
+        return id;
+      } catch (err) {
+        runtimeMetrics.recordKiteLatency(Date.now() - kiteStart);
+        throw err;
+      }
     };
 
     try {

@@ -10,6 +10,7 @@ import {
 } from '../db/database.js';
 import { mapKiteStatus, isTerminalStatus } from '../kite/statusMap.js';
 import { emitOrderUpdate } from '../websocket.js';
+import { positionManager } from '../positions/PositionManager.js';
 import type { KiteOrderRow, OrderLog } from '../types.js';
 
 // =========================================
@@ -211,6 +212,32 @@ class Reconciler {
       kiteResponse: JSON.stringify(kiteOrder),
       errorMessage: kiteOrder.status_message ?? fresh.errorMessage,
     });
+
+    // Feed positions/PnL when reconciliation finds a fill that the postback
+    // layer missed (URL outage, app_id misconfig, etc.). Idempotent: the
+    // PositionManager dedups via cumulative_filled vs prior fills booked.
+    const filledQty = kiteOrder.filled_quantity ?? 0;
+    // Kite's getOrders returns `average_price` as a top-level field but the
+    // typed shape only declares `price`. Read it defensively.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const avgPx = (kiteOrder as any).average_price ?? 0;
+    if (filledQty > 0 && avgPx > 0
+        && newStatus !== 'CANCELLED' && newStatus !== 'REJECTED') {
+      try {
+        positionManager.applyFill({
+          orderLog: { ...fresh, kiteOrderId: kiteOrder.order_id },
+          filledQuantity: filledQty,
+          averagePrice: avgPx,
+          postbackEventId: null, // reconciler has no postback id
+        });
+      } catch (err) {
+        logger.error('Reconciler position fill apply failed', {
+          orderLogId: fresh.id,
+          symbol: fresh.tradingsymbol,
+          error: String(err instanceof Error ? err.stack : err),
+        });
+      }
+    }
 
     logger.info('Reconciled order', {
       compositeKey: fresh.idempotencyKey,

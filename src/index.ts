@@ -5,7 +5,8 @@ import cors from 'cors';
 import path from 'path';
 import { config } from './config.js';
 import { logger } from './logger.js';
-import { initDb } from './db/database.js';
+import { initDb, getPostbackBootSnapshot } from './db/database.js';
+import { runtimeMetrics } from './observability/runtimeMetrics.js';
 import { kiteClient } from './kite/KiteClient.js';
 import { accountRegistry, parseAccountDefs } from './kite/AccountRegistry.js';
 import { initWebSocket, emitTokenStatus } from './websocket.js';
@@ -17,13 +18,26 @@ import { healthLiveRouter, healthFullRouter } from './routes/health.js';
 import { orderMultiRouter } from './routes/orderMulti.js';
 import { adminRouter } from './routes/admin.js';
 import { webhookRouter } from './routes/webhook.js';
+import { positionsRouter, pnlRouter } from './routes/positions.js';
+import { metricsRouter, diagnosticsRouter } from './routes/observability.js';
 import { killSwitch } from './risk/KillSwitch.js';
 import { reconciler } from './oms/Reconciler.js';
+import { positionManager } from './positions/PositionManager.js';
+import { observabilityBroadcaster } from './observability/Broadcaster.js';
 import { alertAsync } from './alerts/Telegram.js';
 
 async function main(): Promise<void> {
   initDb();
   killSwitch.initialize();
+  positionManager.recoverOnStartup();
+
+  // Seed in-process postback counter so the first metrics tick after a mid-day
+  // restart doesn't false-fire the NO_POSTBACKS_DURING_MARKET alert.
+  const pbBoot = getPostbackBootSnapshot();
+  runtimeMetrics.seedPostback(pbBoot.lastReceivedAt, pbBoot.countToday);
+  if (pbBoot.lastReceivedAt) {
+    logger.info('Seeded postback runtime metrics from DB', pbBoot);
+  }
   await kiteClient.initialize();
 
   const accountDefs = parseAccountDefs();
@@ -54,6 +68,10 @@ async function main(): Promise<void> {
   app.use('/order',       requireApiKey, orderActionsRouter); // DELETE/PATCH /:id
   app.use('/order',       requireApiKey, orderRouter);        // POST /
   app.use('/orders',      requireApiKey, ordersRouter);
+  app.use('/positions',   requireApiKey, positionsRouter);
+  app.use('/pnl',         requireApiKey, pnlRouter);
+  app.use('/metrics',     requireApiKey, metricsRouter);
+  app.use('/diagnostics', requireApiKey, diagnosticsRouter);
   app.use('/admin',       requireApiKey, adminRouter);
 
   app.post('/refresh-token', requireApiKey, async (_req, res) => {
@@ -70,7 +88,7 @@ async function main(): Promise<void> {
   // ── UI dashboard — only return SPA shell for non-API paths ──────────────
   const uiDist = path.join(process.cwd(), 'ui', 'dist');
   app.use(express.static(uiDist));
-  const apiPrefixes = ['/order', '/orders', '/admin', '/health', '/refresh-token', '/webhook'];
+  const apiPrefixes = ['/order', '/orders', '/positions', '/pnl', '/metrics', '/diagnostics', '/admin', '/health', '/refresh-token', '/webhook'];
   app.get('*', (req, res, next) => {
     if (apiPrefixes.some((p) => req.path === p || req.path.startsWith(`${p}/`))) {
       res.status(404).json({ error: 'Not found', path: req.path });
@@ -97,10 +115,14 @@ async function main(): Promise<void> {
     .catch((err) => logger.error('Startup reconcile failed', { error: String(err) }))
     .finally(() => reconciler.start());
 
+  // ── Observability broadcaster ───────────────────────────────────────────
+  observabilityBroadcaster.start();
+
   // ── Graceful shutdown ───────────────────────────────────────────────────
   const shutdown = (sig: string) => {
     logger.info('Shutdown signal received', { sig });
     reconciler.stop();
+    observabilityBroadcaster.stop();
     server.close(() => {
       logger.info('Server closed');
       process.exit(0);

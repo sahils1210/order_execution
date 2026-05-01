@@ -19,6 +19,14 @@ function optInt(name: string, fallback: number): number {
   return n;
 }
 
+function optFloat(name: string, fallback: number): number {
+  const v = process.env[name];
+  if (!v) return fallback;
+  const n = parseFloat(v);
+  if (Number.isNaN(n)) throw new Error(`Invalid number for ${name}: ${v}`);
+  return n;
+}
+
 function optBool(name: string, fallback: boolean): boolean {
   const v = process.env[name];
   if (!v) return fallback;
@@ -74,6 +82,22 @@ export const config = {
 
     autoHaltErrorThreshold:    optInt('RISK_AUTO_HALT_ERROR_THRESHOLD',     20),
     autoHaltWindowMs:          optInt('RISK_AUTO_HALT_WINDOW_MS',       60_000),
+  },
+
+  // ── Position Manager / PnL Protection ───────────────────────────────────
+  // 0 / unset = limit disabled. Daily loss is a POSITIVE number (compared
+  // against |totalPnL| when totalPnL < 0). Daily profit triggers at
+  // totalPnL >= maxDailyProfit. Position/exposure are absolute caps.
+  positions: {
+    enabled:                optBool('POSITIONS_ENABLED', true),
+    maxDailyLoss:           optFloat('MAX_DAILY_LOSS',           0),
+    maxDailyProfit:         optFloat('MAX_DAILY_PROFIT',         0),
+    maxPositionPerSymbol:   optFloat('MAX_POSITION_PER_SYMBOL',  0),
+    maxTotalExposure:       optFloat('MAX_TOTAL_EXPOSURE',       0),
+    /** Min ms between consecutive risk evaluations per (account,symbol). */
+    evalDebounceMs:         optInt('POSITIONS_EVAL_DEBOUNCE_MS', 100),
+    /** Auto-halt on breach. If false, only logs+alerts (no kill switch). */
+    haltOnBreach:           optBool('POSITIONS_HALT_ON_BREACH',  true),
   },
 
   // ── Postback / webhook ──────────────────────────────────────────────────

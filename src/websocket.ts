@@ -99,3 +99,29 @@ export function emitOrderConflict(event: OrderConflictEvent): void {
   if (!io) return;
   io.emit('order:conflict', event);
 }
+
+// ── Position / PnL events ────────────────────────────────────────────────
+// We accept `unknown` here to avoid a circular import with PositionManager
+// (which imports websocket helpers). The shape is documented by the
+// PositionView / PnlSummary types in PositionManager.ts.
+
+export function emitPositionUpdate(event: unknown): void {
+  if (!io) return;
+  io.emit('position:update', event);
+}
+
+export function emitPnlUpdate(event: unknown): void {
+  if (!io) return;
+  io.emit('pnl:update', event);
+}
+
+// ── Observability events ─────────────────────────────────────────────────
+export function emitMetricsUpdate(event: unknown): void {
+  if (!io) return;
+  io.emit('metrics:update', event);
+}
+
+export function emitDiagnosticsUpdate(event: unknown): void {
+  if (!io) return;
+  io.emit('diagnostics:update', event);
+}

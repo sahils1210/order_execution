@@ -4,6 +4,7 @@ import { logger } from '../logger.js';
 import {
   findByTagAnyAccount,
   findByKiteOrderId,
+  findByCompositeKey,
   insertPostbackEvent,
   updatePostbackProcessing,
   updateStatusByCompositeKey,
@@ -14,6 +15,8 @@ import { mapKiteStatus, isTerminalStatus } from '../kite/statusMap.js';
 import { killSwitch } from '../risk/KillSwitch.js';
 import { emitOrderUpdate, emitOrderConflict } from '../websocket.js';
 import { alertAsync } from '../alerts/Telegram.js';
+import { positionManager } from '../positions/PositionManager.js';
+import { runtimeMetrics } from '../observability/runtimeMetrics.js';
 import type {
   KitePostbackPayload,
   OrderLog,
@@ -57,6 +60,7 @@ export class PostbackHandler {
   }
 
   async handle(payload: KitePostbackPayload, rawBody: string): Promise<PostbackProcessResult> {
+    runtimeMetrics.recordPostbackReceived();
     const checksumValid = this.verifyChecksum(payload);
     if (!checksumValid) {
       logger.warn('Postback received with invalid/missing checksum', {
@@ -116,6 +120,29 @@ export class PostbackHandler {
     if (!row) {
       const recovered = this.createRecoveryRow(payload, newStatus);
       updatePostbackProcessing(ins.id, recovered.id, false, null, true);
+
+      // Apply fill to position state for the recovery order too. This catches
+      // orphan postbacks (e.g. orders placed via Kite UI / older sessions).
+      const filledQty = payload.filled_quantity ?? 0;
+      const avgPx     = payload.average_price   ?? 0;
+      if (filledQty > 0 && avgPx > 0
+          && newStatus !== 'CANCELLED' && newStatus !== 'REJECTED') {
+        try {
+          positionManager.applyFill({
+            orderLog: recovered,
+            filledQuantity: filledQty,
+            averagePrice: avgPx,
+            postbackEventId: ins.id,
+          });
+        } catch (err) {
+          logger.error('Position fill apply (recovery) threw', {
+            orderLogId: recovered.id,
+            symbol: recovered.tradingsymbol,
+            error: String(err instanceof Error ? err.stack : err),
+          });
+        }
+      }
+
       logger.warn('Postback for unknown order — recovery row created', {
         orderId: payload.order_id,
         tag: payload.tag,
@@ -226,6 +253,30 @@ export class PostbackHandler {
     });
 
     updatePostbackProcessing(postbackId, row.id, false, null, false);
+
+    // ── Position fill application ────────────────────────────────────────
+    // Apply on any forward postback (partial COMPLETE, full COMPLETE).
+    // PositionManager handles idempotency on (postback_event_id, order_log_id)
+    // and on cumulative-vs-previous comparison.
+    const filledQty = payload.filled_quantity ?? 0;
+    const avgPx     = payload.average_price   ?? 0;
+    if (filledQty > 0 && avgPx > 0 && newStatus !== 'CANCELLED' && newStatus !== 'REJECTED') {
+      const fresh = findByCompositeKey(row.idempotencyKey) ?? row;
+      try {
+        positionManager.applyFill({
+          orderLog: fresh,
+          filledQuantity: filledQty,
+          averagePrice: avgPx,
+          postbackEventId: postbackId,
+        });
+      } catch (err) {
+        logger.error('Position fill apply threw', {
+          orderLogId: fresh.id,
+          symbol: fresh.tradingsymbol,
+          error: String(err instanceof Error ? err.stack : err),
+        });
+      }
+    }
 
     logger.info('Postback applied', {
       compositeKey: row.idempotencyKey,

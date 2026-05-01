@@ -141,6 +141,73 @@ function runMigrations(): void {
     CREATE INDEX IF NOT EXISTS idx_pb_received ON postback_events(received_at);
   `);
   recordVersion(4);
+
+  // v5: positions / PnL tables
+  // ── positions ─────────────────────────────────────────────────────────
+  // One row per (account_id, exchange, tradingsymbol, trade_date).
+  // trade_date is an ISO date string (YYYY-MM-DD, IST) — positions reset
+  // daily so MIS positions don't bleed across days. CNC/NRML "carry" via
+  // restart recovery seeding from broker net positions on next startup.
+  //
+  // net_quantity   = signed: positive = long, negative = short
+  // average_price  = cost basis of the OPEN portion only; reset to 0 when flat
+  // realized_pnl   = locked-in PnL from closed trades (this trade_date)
+  // last_price     = last observed price (from postback fill or external tick)
+  // applied_fills_qty / total_buy_qty / total_sell_qty are running totals
+  //   for diagnostics + idempotency cross-checks
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS positions (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id          TEXT    NOT NULL,
+      exchange            TEXT    NOT NULL,
+      tradingsymbol       TEXT    NOT NULL,
+      trade_date          TEXT    NOT NULL,
+      net_quantity        INTEGER NOT NULL DEFAULT 0,
+      average_price       REAL    NOT NULL DEFAULT 0,
+      realized_pnl        REAL    NOT NULL DEFAULT 0,
+      last_price          REAL,
+      total_buy_qty       INTEGER NOT NULL DEFAULT 0,
+      total_sell_qty      INTEGER NOT NULL DEFAULT 0,
+      total_buy_value     REAL    NOT NULL DEFAULT 0,
+      total_sell_value    REAL    NOT NULL DEFAULT 0,
+      updated_at          TEXT    NOT NULL,
+      UNIQUE (account_id, exchange, tradingsymbol, trade_date)
+    );
+    CREATE INDEX IF NOT EXISTS idx_pos_account ON positions(account_id);
+    CREATE INDEX IF NOT EXISTS idx_pos_date    ON positions(trade_date);
+    CREATE INDEX IF NOT EXISTS idx_pos_symbol  ON positions(tradingsymbol);
+  `);
+
+  // ── position_fills ────────────────────────────────────────────────────
+  // Append-only ledger of fills applied to positions. The (postback_event_id,
+  // delta_quantity) pair is used to make fill application idempotent — the
+  // same postback delivered twice (or replayed via reconcile) must never
+  // apply the same delta twice.
+  //
+  // delta_quantity = the INCREMENT in filled_quantity that this row applied,
+  // signed by transaction direction (+ for BUY, - for SELL).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS position_fills (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      position_id         INTEGER NOT NULL,
+      order_log_id        INTEGER,
+      postback_event_id   INTEGER,
+      kite_order_id       TEXT,
+      transaction_type    TEXT    NOT NULL,
+      delta_quantity      INTEGER NOT NULL,
+      fill_price          REAL    NOT NULL,
+      cumulative_filled   INTEGER NOT NULL,
+      realized_delta      REAL    NOT NULL DEFAULT 0,
+      applied_at          TEXT    NOT NULL,
+      FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_pf_position    ON position_fills(position_id);
+    CREATE INDEX IF NOT EXISTS idx_pf_order_log   ON position_fills(order_log_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pf_postback_dedup
+      ON position_fills(postback_event_id, order_log_id)
+      WHERE postback_event_id IS NOT NULL;
+  `);
+  recordVersion(5);
 }
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -503,6 +570,209 @@ export function updatePostbackProcessing(
   );
 }
 
+// ─── Metrics aggregations ───────────────────────────────────────────────────
+export interface OrderMetricsAggregate {
+  total: number;
+  byStatus: Record<string, number>;
+  bySource: Record<string, number>;
+  avgLatencyMs: number;
+  maxLatencyMs: number;
+  p95LatencyMs: number;
+  rejectedCount: number;
+  unknownCount: number;
+  /** UNKNOWN orders older than `staleAgeMs` — these are the dangerous ones. */
+  staleUnknownCount: number;
+  conflictCount: number;
+  /** Number of orders updated by reconciliation (postbackConfirmedAt IS NULL but completed). */
+  reconciledCount: number;
+}
+
+/**
+ * Aggregate order metrics for a time window. `sinceIso` is inclusive lower bound
+ * on `received_at`. Includes only "real" orders (excludes recovery rows by default).
+ */
+export function aggregateOrderMetrics(sinceIso: string, staleUnknownAgeMs: number): OrderMetricsAggregate {
+  const totalRow = db.prepare(`
+    SELECT COUNT(*) AS c FROM order_logs
+     WHERE received_at >= ? AND account_id != 'recovery'
+  `).get(sinceIso) as { c: number };
+
+  const statusRows = db.prepare(`
+    SELECT status, COUNT(*) AS c FROM order_logs
+     WHERE received_at >= ? AND account_id != 'recovery'
+     GROUP BY status
+  `).all(sinceIso) as Array<{ status: string; c: number }>;
+
+  const sourceRows = db.prepare(`
+    SELECT source, COUNT(*) AS c FROM order_logs
+     WHERE received_at >= ? AND account_id != 'recovery'
+     GROUP BY source
+  `).all(sinceIso) as Array<{ source: string; c: number }>;
+
+  // Latency stats only for orders that actually got placed (latency_ms > 0).
+  const latencyRow = db.prepare(`
+    SELECT AVG(latency_ms) AS avg, MAX(latency_ms) AS max
+      FROM order_logs
+     WHERE received_at >= ? AND account_id != 'recovery' AND latency_ms > 0
+  `).get(sinceIso) as { avg: number | null; max: number | null };
+
+  // p95 via SQLite ordered scan — fine at order_logs scale (<<100k/day).
+  const latencies = db.prepare(`
+    SELECT latency_ms FROM order_logs
+     WHERE received_at >= ? AND account_id != 'recovery' AND latency_ms > 0
+     ORDER BY latency_ms ASC
+  `).all(sinceIso) as Array<{ latency_ms: number }>;
+  let p95 = 0;
+  if (latencies.length > 0) {
+    const idx = Math.min(latencies.length - 1, Math.floor(latencies.length * 0.95));
+    p95 = latencies[idx]!.latency_ms;
+  }
+
+  const staleCutoff = new Date(Date.now() - staleUnknownAgeMs).toISOString();
+  const staleUnknown = db.prepare(`
+    SELECT COUNT(*) AS c FROM order_logs
+     WHERE status = 'UNKNOWN'
+       AND received_at < ?
+       AND account_id != 'recovery'
+  `).get(staleCutoff) as { c: number };
+
+  const conflict = db.prepare(`
+    SELECT COUNT(*) AS c FROM order_logs
+     WHERE conflict_message IS NOT NULL AND received_at >= ?
+  `).get(sinceIso) as { c: number };
+
+  // Reconciled = terminal but no postback confirmation (best-effort proxy).
+  const reconciled = db.prepare(`
+    SELECT COUNT(*) AS c FROM order_logs
+     WHERE received_at >= ?
+       AND account_id != 'recovery'
+       AND completed_at IS NOT NULL
+       AND postback_confirmed_at IS NULL
+       AND status IN ('COMPLETE', 'CANCELLED', 'REJECTED', 'ERROR')
+  `).get(sinceIso) as { c: number };
+
+  const byStatus: Record<string, number> = {};
+  for (const r of statusRows) byStatus[r.status] = r.c;
+  const bySource: Record<string, number> = {};
+  for (const r of sourceRows) bySource[r.source] = r.c;
+
+  return {
+    total: totalRow.c,
+    byStatus,
+    bySource,
+    avgLatencyMs: Math.round(latencyRow.avg ?? 0),
+    maxLatencyMs: latencyRow.max ?? 0,
+    p95LatencyMs: p95,
+    rejectedCount:     byStatus['REJECTED'] ?? 0,
+    unknownCount:      byStatus['UNKNOWN']  ?? 0,
+    staleUnknownCount: staleUnknown.c,
+    conflictCount:     conflict.c,
+    reconciledCount:   reconciled.c,
+  };
+}
+
+export interface PostbackMetricsAggregate {
+  totalReceived: number;
+  duplicateCount: number;
+  conflictCount: number;
+  recoveryCount: number;
+  invalidChecksumCount: number;
+  /** Most recent postback received_at (ISO string) or null. */
+  lastReceivedAt: string | null;
+  /** Avg ms between order_logs.last_attempt_at and matched postback_events.received_at. */
+  avgPostbackDelayMs: number | null;
+}
+
+export function aggregatePostbackMetrics(sinceIso: string): PostbackMetricsAggregate {
+  const totalRow = db.prepare(`SELECT COUNT(*) AS c FROM postback_events WHERE received_at >= ?`)
+    .get(sinceIso) as { c: number };
+
+  const conflictRow = db.prepare(`
+    SELECT COUNT(*) AS c FROM postback_events WHERE received_at >= ? AND conflict = 1
+  `).get(sinceIso) as { c: number };
+
+  const recoveryRow = db.prepare(`
+    SELECT COUNT(*) AS c FROM postback_events WHERE received_at >= ? AND recovery_created = 1
+  `).get(sinceIso) as { c: number };
+
+  const invalidRow = db.prepare(`
+    SELECT COUNT(*) AS c FROM postback_events WHERE received_at >= ? AND checksum_valid = 0
+  `).get(sinceIso) as { c: number };
+
+  // Duplicates aren't stored; count = approximated as 0 (INSERT OR IGNORE
+  // dropped them before they could be inserted). Real signal lives in logs.
+  const lastRow = db.prepare(`
+    SELECT received_at FROM postback_events ORDER BY id DESC LIMIT 1
+  `).get() as { received_at: string } | undefined;
+
+  // Postback delay = postback_events.received_at − order_logs.last_attempt_at
+  // for matched rows where both timestamps exist. Cheap because we have indexes.
+  const delayRow = db.prepare(`
+    SELECT AVG((julianday(p.received_at) - julianday(o.last_attempt_at)) * 86400000.0) AS d
+      FROM postback_events p
+      JOIN order_logs o ON o.id = p.matched_log_id
+     WHERE p.received_at >= ?
+       AND p.matched_log_id IS NOT NULL
+       AND o.last_attempt_at IS NOT NULL
+  `).get(sinceIso) as { d: number | null };
+
+  return {
+    totalReceived:        totalRow.c,
+    duplicateCount:       0, // not persisted — see comment above
+    conflictCount:        conflictRow.c,
+    recoveryCount:        recoveryRow.c,
+    invalidChecksumCount: invalidRow.c,
+    lastReceivedAt:       lastRow?.received_at ?? null,
+    avgPostbackDelayMs:   delayRow.d != null && Number.isFinite(delayRow.d)
+                            ? Math.round(delayRow.d)
+                            : null,
+  };
+}
+
+/**
+ * Boot-time snapshot of postback persistence state. Used by runtimeMetrics
+ * to avoid a false NO_POSTBACKS alert on the first /metrics tick after a
+ * mid-day restart.
+ */
+export function getPostbackBootSnapshot(): { lastReceivedAt: string | null; countToday: number } {
+  const last = db.prepare(`SELECT received_at FROM postback_events ORDER BY id DESC LIMIT 1`)
+    .get() as { received_at: string } | undefined;
+
+  // Today (IST) midnight in UTC ISO — same window logic as MetricsService.
+  const istNow = new Date(Date.now() + 5.5 * 3600 * 1000);
+  const tradeDate = istNow.toISOString().slice(0, 10);
+  const istMidnight = new Date(`${tradeDate}T00:00:00+05:30`).toISOString();
+  const countRow = db.prepare(`SELECT COUNT(*) AS c FROM postback_events WHERE received_at >= ?`)
+    .get(istMidnight) as { c: number };
+
+  return {
+    lastReceivedAt: last?.received_at ?? null,
+    countToday: countRow.c,
+  };
+}
+
+/** Cheap probe — verifies SQLite is responsive for both reads and writes. */
+export function dbHealthProbe(): { readOk: boolean; writeOk: boolean; errorMessage: string | null } {
+  try {
+    const r = db.prepare('SELECT 1 AS ok').get() as { ok: number } | undefined;
+    if (r?.ok !== 1) return { readOk: false, writeOk: false, errorMessage: 'unexpected SELECT result' };
+  } catch (err) {
+    return { readOk: false, writeOk: false, errorMessage: String(err) };
+  }
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS health_probe (id INTEGER PRIMARY KEY CHECK (id = 1), ts TEXT NOT NULL);
+    `);
+    db.prepare(`
+      INSERT INTO health_probe (id, ts) VALUES (1, ?)
+      ON CONFLICT(id) DO UPDATE SET ts = excluded.ts
+    `).run(new Date().toISOString());
+    return { readOk: true, writeOk: true, errorMessage: null };
+  } catch (err) {
+    return { readOk: true, writeOk: false, errorMessage: String(err) };
+  }
+}
+
 // ─── Daily housekeeping ─────────────────────────────────────────────────────
 export function pruneOldOrders(retentionDays: number): number {
   if (retentionDays <= 0) return 0;
@@ -536,6 +806,215 @@ export function setKillSwitch(halted: boolean, reason: string | null, source: st
   db.prepare(`
     UPDATE kill_switch SET halted = ?, reason = ?, source = ?, updated_at = ? WHERE id = 1
   `).run(halted ? 1 : 0, reason, source, new Date().toISOString());
+}
+
+// ─── Positions ──────────────────────────────────────────────────────────────
+export interface PositionRow {
+  id: number;
+  accountId: string;
+  exchange: string;
+  tradingsymbol: string;
+  tradeDate: string;
+  netQuantity: number;
+  averagePrice: number;
+  realizedPnl: number;
+  lastPrice: number | null;
+  totalBuyQty: number;
+  totalSellQty: number;
+  totalBuyValue: number;
+  totalSellValue: number;
+  updatedAt: string;
+}
+
+function rowToPosition(row: Record<string, unknown>): PositionRow {
+  return {
+    id:             row.id              as number,
+    accountId:      row.account_id      as string,
+    exchange:       row.exchange        as string,
+    tradingsymbol:  row.tradingsymbol   as string,
+    tradeDate:      row.trade_date      as string,
+    netQuantity:    row.net_quantity    as number,
+    averagePrice:   row.average_price   as number,
+    realizedPnl:    row.realized_pnl    as number,
+    lastPrice:      row.last_price      as number | null,
+    totalBuyQty:    row.total_buy_qty   as number,
+    totalSellQty:   row.total_sell_qty  as number,
+    totalBuyValue:  row.total_buy_value as number,
+    totalSellValue: row.total_sell_value as number,
+    updatedAt:      row.updated_at      as string,
+  };
+}
+
+/** Find or create a position row for (account, exchange, symbol, date). */
+export function upsertPositionRow(
+  accountId: string,
+  exchange: string,
+  tradingsymbol: string,
+  tradeDate: string,
+): PositionRow {
+  const existing = db.prepare(`
+    SELECT * FROM positions
+     WHERE account_id = ? AND exchange = ? AND tradingsymbol = ? AND trade_date = ?
+  `).get(accountId, exchange, tradingsymbol, tradeDate) as Record<string, unknown> | undefined;
+  if (existing) return rowToPosition(existing);
+
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO positions (account_id, exchange, tradingsymbol, trade_date, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(accountId, exchange, tradingsymbol, tradeDate, now);
+
+  const fresh = db.prepare(`
+    SELECT * FROM positions
+     WHERE account_id = ? AND exchange = ? AND tradingsymbol = ? AND trade_date = ?
+  `).get(accountId, exchange, tradingsymbol, tradeDate) as Record<string, unknown>;
+  return rowToPosition(fresh);
+}
+
+export function getPositionById(id: number): PositionRow | null {
+  const row = db.prepare('SELECT * FROM positions WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+  return row ? rowToPosition(row) : null;
+}
+
+export function listPositionsForDate(tradeDate: string): PositionRow[] {
+  const rows = db.prepare(`
+    SELECT * FROM positions WHERE trade_date = ? ORDER BY account_id, tradingsymbol
+  `).all(tradeDate) as Record<string, unknown>[];
+  return rows.map(rowToPosition);
+}
+
+export function updatePositionRow(p: PositionRow): void {
+  db.prepare(`
+    UPDATE positions
+       SET net_quantity     = ?,
+           average_price    = ?,
+           realized_pnl     = ?,
+           last_price       = ?,
+           total_buy_qty    = ?,
+           total_sell_qty   = ?,
+           total_buy_value  = ?,
+           total_sell_value = ?,
+           updated_at       = ?
+     WHERE id = ?
+  `).run(
+    p.netQuantity,
+    p.averagePrice,
+    p.realizedPnl,
+    p.lastPrice,
+    p.totalBuyQty,
+    p.totalSellQty,
+    p.totalBuyValue,
+    p.totalSellValue,
+    new Date().toISOString(),
+    p.id,
+  );
+}
+
+export function updateLastPrice(positionId: number, lastPrice: number): void {
+  db.prepare('UPDATE positions SET last_price = ?, updated_at = ? WHERE id = ?')
+    .run(lastPrice, new Date().toISOString(), positionId);
+}
+
+// ─── Position fills ─────────────────────────────────────────────────────────
+export interface PositionFillRow {
+  id: number;
+  positionId: number;
+  orderLogId: number | null;
+  postbackEventId: number | null;
+  kiteOrderId: string | null;
+  transactionType: string;
+  deltaQuantity: number;
+  fillPrice: number;
+  cumulativeFilled: number;
+  realizedDelta: number;
+  appliedAt: string;
+}
+
+/** Returns the cumulative_filled most recently applied for a given orderLogId. */
+export function getLastCumulativeFilled(orderLogId: number): number {
+  const row = db.prepare(`
+    SELECT cumulative_filled FROM position_fills
+     WHERE order_log_id = ?
+     ORDER BY id DESC LIMIT 1
+  `).get(orderLogId) as { cumulative_filled: number } | undefined;
+  return row?.cumulative_filled ?? 0;
+}
+
+/**
+ * Returns the cumulative VALUE (sum of |deltaQty| * fillPrice) booked so far
+ * for a given orderLogId. Used to derive the MARGINAL fill price from a
+ * cumulative postback: marginalPrice = (cumQty*postbackAvg - priorValue) / deltaQty.
+ */
+export function getCumulativeFillValue(orderLogId: number): number {
+  const row = db.prepare(`
+    SELECT COALESCE(SUM(ABS(delta_quantity) * fill_price), 0) AS value
+      FROM position_fills WHERE order_log_id = ?
+  `).get(orderLogId) as { value: number } | undefined;
+  return row?.value ?? 0;
+}
+
+export interface InsertFillResult {
+  applied: boolean;
+  fillId: number;
+}
+
+/**
+ * Insert a fill row idempotently. The (postback_event_id, order_log_id)
+ * unique index protects against double-application of the same postback.
+ *
+ * Returns { applied: false } if the fill was already applied.
+ */
+export function insertPositionFill(p: {
+  positionId: number;
+  orderLogId: number | null;
+  postbackEventId: number | null;
+  kiteOrderId: string | null;
+  transactionType: string;
+  deltaQuantity: number;
+  fillPrice: number;
+  cumulativeFilled: number;
+  realizedDelta: number;
+}): InsertFillResult {
+  try {
+    const result = db.prepare(`
+      INSERT INTO position_fills (
+        position_id, order_log_id, postback_event_id, kite_order_id,
+        transaction_type, delta_quantity, fill_price,
+        cumulative_filled, realized_delta, applied_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      p.positionId,
+      p.orderLogId,
+      p.postbackEventId,
+      p.kiteOrderId,
+      p.transactionType,
+      p.deltaQuantity,
+      p.fillPrice,
+      p.cumulativeFilled,
+      p.realizedDelta,
+      new Date().toISOString(),
+    ) as { lastInsertRowid: number | bigint };
+    return { applied: true, fillId: Number(result.lastInsertRowid) };
+  } catch (err) {
+    // UNIQUE violation on (postback_event_id, order_log_id) → already applied
+    if (err instanceof Error && /UNIQUE/i.test(err.message)) {
+      return { applied: false, fillId: 0 };
+    }
+    throw err;
+  }
+}
+
+/** Run callback inside a transaction. Used to make fill+position update atomic. */
+export function withTransaction<T>(fn: () => T): T {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    throw err;
+  }
 }
 
 // ─── Row mapper ─────────────────────────────────────────────────────────────
