@@ -120,6 +120,22 @@ export const config = {
     requireApiKey: optBool('WS_REQUIRE_API_KEY', true),
   },
 
+  // ── Token architecture ──────────────────────────────────────────────────
+  /**
+   * When TRUE: every non-master account request MUST carry
+   * `accountTokens[accountId]` in the body. Missing → HTTP 422
+   * `MISSING_ACCOUNT_TOKEN`. The gateway never falls back to its
+   * AccountRegistry token for non-master accounts in this mode.
+   *
+   * When FALSE (legacy): gateway falls back to AccountRegistry-managed
+   * tokens when `accountTokens` is absent. `accountTokens` is still
+   * honoured if supplied.
+   *
+   * Default FALSE for first deploy; flip to TRUE after Scalper-side
+   * UnifiedTokenSource is verified in soak.
+   */
+  strictAccountTokens: optBool('STRICT_ACCOUNT_TOKENS', false),
+
   // ── Alerts ──────────────────────────────────────────────────────────────
   alerts: {
     telegram: {

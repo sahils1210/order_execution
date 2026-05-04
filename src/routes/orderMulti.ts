@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { orderManager } from '../oms/OrderManager.js';
 import { accountRegistry } from '../kite/AccountRegistry.js';
+import { config } from '../config.js';
 import { logger } from '../logger.js';
 import type { OrderRequest, OrderStatus } from '../types.js';
 
@@ -18,6 +19,10 @@ export const orderMultiRouter = Router();
 
 interface MultiOrderRequest extends OrderRequest {
   accounts: string[];
+  // accountTokens is inherited from OrderRequest. Documented here:
+  //   STRICT_ACCOUNT_TOKENS=true → every non-master id in `accounts`
+  //   MUST have a corresponding `accountTokens[id]` entry. Missing any
+  //   one of them rejects the ENTIRE batch with 422 before any DB writes.
 }
 
 interface AccountResult {
@@ -53,6 +58,24 @@ orderMultiRouter.post('/', async (req: Request, res: Response): Promise<void> =>
   if (unknown.length > 0) {
     res.status(400).json({ error: `Unknown account IDs: ${unknown.join(', ')}` });
     return;
+  }
+
+  // STRICT mode: pre-validate that EVERY non-master account in the batch
+  // has a corresponding accountTokens entry. Reject the entire batch BEFORE
+  // any DB writes / dispatches if any are missing — partial dispatch on a
+  // multi-account order is unsafe (the missing leg would diverge silently).
+  if (config.strictAccountTokens) {
+    const missingTokens = body.accounts.filter(
+      (acc) => acc !== 'master' && !body.accountTokens?.[acc],
+    );
+    if (missingTokens.length > 0) {
+      res.status(422).json({
+        error: `Missing accountTokens for accounts: ${missingTokens.join(', ')}`,
+        errorCode: 'MISSING_ACCOUNT_TOKEN',
+        accounts: missingTokens,
+      });
+      return;
+    }
   }
 
   logger.info('Multi-account order received', {

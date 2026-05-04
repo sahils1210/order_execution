@@ -23,9 +23,13 @@ orderActionsRouter.delete('/:orderId', async (req: Request, res: Response): Prom
     return;
   }
 
-  logger.info('Cancel order request', { orderId, variety, accountId });
+  // Optional per-account token override (same semantics as POST /order).
+  const accountTokens = (req.body as { accountTokens?: Record<string, string> } | undefined)?.accountTokens;
+  const tokenOverride = accountTokens?.[accountId];
 
-  const result = await orderManager.cancelOrder(orderId.trim(), variety, accountId);
+  logger.info('Cancel order request', { orderId, variety, accountId, tokenOverridden: !!tokenOverride });
+
+  const result = await orderManager.cancelOrder(orderId.trim(), variety, accountId, tokenOverride);
   if (result.success) {
     res.status(200).json({
       success: true,
@@ -52,12 +56,14 @@ orderActionsRouter.patch('/:orderId', async (req: Request, res: Response): Promi
     return;
   }
 
-  const { price, triggerPrice, quantity, orderType } = req.body as {
+  const { price, triggerPrice, quantity, orderType, accountTokens } = req.body as {
     price?: number;
     triggerPrice?: number;
     quantity?: number;
     orderType?: string;
+    accountTokens?: Record<string, string>;
   };
+  const tokenOverride = accountTokens?.[accountId];
 
   if (price == null && triggerPrice == null && quantity == null && orderType == null) {
     res.status(400).json({
@@ -68,13 +74,14 @@ orderActionsRouter.patch('/:orderId', async (req: Request, res: Response): Promi
     return;
   }
 
-  logger.info('Modify order request', { orderId, variety, accountId, price, triggerPrice, quantity, orderType });
+  logger.info('Modify order request', { orderId, variety, accountId, price, triggerPrice, quantity, orderType, tokenOverridden: !!tokenOverride });
 
   const result = await orderManager.modifyOrder(
     orderId.trim(),
     variety,
     { price, triggerPrice, quantity, orderType },
     accountId,
+    tokenOverride,
   );
 
   if (result.success) {

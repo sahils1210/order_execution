@@ -3,7 +3,8 @@ import { config } from '../config.js';
 import { logger } from '../logger.js';
 import { kiteClient } from '../kite/KiteClient.js';
 import { accountRegistry } from '../kite/AccountRegistry.js';
-import { classifyKiteError, KiteTimeoutError } from '../kite/errors.js';
+import { classifyKiteError, KiteTimeoutError, MissingAccountTokenError, TokenInvalidForNonMasterError } from '../kite/errors.js';
+import { makePerRequestKite } from '../kite/perRequestKite.js';
 import { bucketFor } from '../kite/RateLimiter.js';
 import {
   atomicCheckAndInsert,
@@ -35,7 +36,7 @@ export interface PlacementResult {
   error: string | null;
   latencyMs: number;
   cached: boolean;
-  errorCode?: 'KEY_REUSE';
+  errorCode?: 'KEY_REUSE' | 'MISSING_ACCOUNT_TOKEN' | 'TOKEN_INVALID';
 }
 
 export interface CancellationResult {
@@ -71,11 +72,15 @@ class OrderManager {
       return fail('ERROR', pre.reason ?? 'Pre-trade check failed', startMs);
     }
 
-    // 4. Resolve account
+    // 4. Resolve account (per-request token override if supplied)
+    const tokenOverride = req.accountTokens?.[accountId];
     let kite: Connect;
     try {
-      kite = this.kiteFor(accountId);
+      kite = this.kiteFor(accountId, tokenOverride);
     } catch (err) {
+      if (err instanceof MissingAccountTokenError) {
+        return fail('REJECTED', err.message, startMs, 'MISSING_ACCOUNT_TOKEN');
+      }
       return fail('ERROR', String(err instanceof Error ? err.message : err), startMs);
     }
 
@@ -124,6 +129,7 @@ class OrderManager {
     let orderId: string | null = null;
     let finalStatus: OrderStatus = 'ERROR';
     let errorMessage: string | null = null;
+    let nonMasterTokenInvalid = false;
 
     try {
       orderId = await this.placeWithPolicy(kite, accountId, variety, params, tag, compositeKey);
@@ -132,23 +138,31 @@ class OrderManager {
       autoHaltMonitor.recordSuccess();
       runtimeMetrics.recordKiteCallSuccess();
     } catch (err) {
-      const c = classifyKiteError(err);
-      errorMessage = `[${c.kind}] ${c.message}`;
-      runtimeMetrics.recordKiteCallError(`${c.kind}: ${c.message}`);
-
-      if (c.kind === 'TIMEOUT' || c.kind === 'MIDFLIGHT_RESET') {
-        finalStatus = 'UNKNOWN';
-        scheduleOneShotReconcile(compositeKey, accountId, tag);
-      } else if (c.kind === 'REJECTED' || c.kind === 'PERMISSION') {
+      // Non-master TOKEN error → surface TOKEN_INVALID, no internal refresh.
+      if (err instanceof TokenInvalidForNonMasterError) {
         finalStatus = 'REJECTED';
-        circuitBreaker.recordError(req.source, req.tradingsymbol);
-        autoHaltMonitor.recordError();
-      } else if (c.kind === 'INPUT') {
-        finalStatus = 'ERROR';
+        errorMessage = 'Provided account token rejected by Kite';
+        nonMasterTokenInvalid = true;
+        runtimeMetrics.recordKiteCallError(`TOKEN_INVALID: ${err.originalMessage}`);
       } else {
-        finalStatus = 'ERROR';
-        circuitBreaker.recordError(req.source, req.tradingsymbol);
-        autoHaltMonitor.recordError();
+        const c = classifyKiteError(err);
+        errorMessage = `[${c.kind}] ${c.message}`;
+        runtimeMetrics.recordKiteCallError(`${c.kind}: ${c.message}`);
+
+        if (c.kind === 'TIMEOUT' || c.kind === 'MIDFLIGHT_RESET') {
+          finalStatus = 'UNKNOWN';
+          scheduleOneShotReconcile(compositeKey, accountId, tag);
+        } else if (c.kind === 'REJECTED' || c.kind === 'PERMISSION') {
+          finalStatus = 'REJECTED';
+          circuitBreaker.recordError(req.source, req.tradingsymbol);
+          autoHaltMonitor.recordError();
+        } else if (c.kind === 'INPUT') {
+          finalStatus = 'ERROR';
+        } else {
+          finalStatus = 'ERROR';
+          circuitBreaker.recordError(req.source, req.tradingsymbol);
+          autoHaltMonitor.recordError();
+        }
       }
     }
 
@@ -216,18 +230,19 @@ class OrderManager {
       error: success ? null : errorMessage,
       latencyMs,
       cached: false,
+      ...(nonMasterTokenInvalid ? { errorCode: 'TOKEN_INVALID' as const } : {}),
     };
   }
 
   // ─── Cancel ───────────────────────────────────────────────────────────────
   // CRITICAL: cancellation is ALWAYS allowed, even when the kill switch is
   // engaged. Halting must never lock the operator out of reducing exposure.
-  async cancelOrder(orderId: string, variety: string, accountId: string): Promise<CancellationResult> {
+  async cancelOrder(orderId: string, variety: string, accountId: string, tokenOverride?: string): Promise<CancellationResult> {
     const startMs = Date.now();
 
     let kite: Connect;
     try {
-      kite = this.kiteFor(accountId);
+      kite = this.kiteFor(accountId, tokenOverride);
     } catch (err) {
       return cancelFail(String(err instanceof Error ? err.message : err), startMs);
     }
@@ -253,12 +268,13 @@ class OrderManager {
     variety: string,
     params: { price?: number; triggerPrice?: number; quantity?: number; orderType?: string },
     accountId: string,
+    tokenOverride?: string,
   ): Promise<CancellationResult> {
     const startMs = Date.now();
 
     let kite: Connect;
     try {
-      kite = this.kiteFor(accountId);
+      kite = this.kiteFor(accountId, tokenOverride);
     } catch (err) {
       return cancelFail(String(err instanceof Error ? err.message : err), startMs);
     }
@@ -284,10 +300,28 @@ class OrderManager {
 
   // ─── Internals ────────────────────────────────────────────────────────────
 
-  private kiteFor(accountId: string): Connect {
+  private kiteFor(accountId: string, tokenOverride?: string): Connect {
+    // Per-request token override (preferred path under STRICT_ACCOUNT_TOKENS).
+    // Always honoured when supplied, regardless of the strict flag — the
+    // caller has explicitly named the token they want this request to use.
+    if (tokenOverride) {
+      const apiKey = this.resolveApiKey(accountId);
+      if (!apiKey) {
+        throw new Error(`No apiKey configured for account '${accountId}' — cannot build per-request KiteConnect`);
+      }
+      return makePerRequestKite(apiKey, tokenOverride);
+    }
+
     if (accountId === 'master') {
       if (!kiteClient.isConnected()) throw new Error('Master Kite client not connected');
       return kiteClient.getRawKite();
+    }
+
+    // Non-master, no override:
+    //   STRICT=true  → REJECT (caller is required to supply accountTokens).
+    //   STRICT=false → fall back to AccountRegistry-managed token (legacy).
+    if (config.strictAccountTokens) {
+      throw new MissingAccountTokenError(accountId);
     }
     const k = accountRegistry.getKite(accountId);
     if (!k) throw new Error(`Unknown account: ${accountId}`);
@@ -295,6 +329,11 @@ class OrderManager {
       throw new Error(`Account ${accountId} has invalid token`);
     }
     return k;
+  }
+
+  private resolveApiKey(accountId: string): string | null {
+    if (accountId === 'master') return config.kite.apiKey;
+    return accountRegistry.getApiKey(accountId);
   }
 
   private async refreshAccount(accountId: string): Promise<void> {
@@ -339,6 +378,14 @@ class OrderManager {
       const c = classifyKiteError(err);
 
       if (c.kind === 'TOKEN') {
+        // Non-master accounts: Scalper is the token authority. Do NOT refresh
+        // server-side. Surface TOKEN_INVALID so the caller can force-refresh
+        // its own TokenManager and retry with a fresh idempotency key.
+        if (accountId !== 'master') {
+          logger.warn('Token rejected for non-master account — surfacing TOKEN_INVALID', { accountId, tag });
+          throw new TokenInvalidForNonMasterError(accountId, c.message);
+        }
+
         logger.warn('Token error during placeOrder — refreshing and retrying once', { accountId, tag });
         try {
           await this.refreshAccount(accountId);

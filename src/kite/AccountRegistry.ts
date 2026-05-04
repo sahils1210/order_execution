@@ -79,6 +79,15 @@ class AccountRegistry {
     return this.accounts.get(accountId)?.valid ?? false;
   }
 
+  /**
+   * Returns the configured Kite api_key for an account, or null when the
+   * account is unknown. Used by per-request KiteConnect construction when
+   * the caller supplies an override token via `accountTokens[accountId]`.
+   */
+  getApiKey(accountId: string): string | null {
+    return this.accounts.get(accountId)?.def.apiKey ?? null;
+  }
+
   getAccountIds(): string[] {
     return Array.from(this.accounts.keys());
   }

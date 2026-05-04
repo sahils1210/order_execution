@@ -30,12 +30,17 @@ orderRouter.post('/', async (req: Request, res: Response): Promise<void> => {
   // HTTP semantics:
   //   200 → ACCEPTED / COMPLETE (or cached duplicate that succeeded)
   //   202 → UNKNOWN (timeout — outcome will resolve via reconciliation)
+  //   401 → TOKEN_INVALID (non-master token rejected by Kite — caller must refresh)
   //   409 → in-flight duplicate (RECEIVED/SUBMITTING in DB, cached returned non-success)
-  //   422 → REJECTED by Kite, OR idempotencyKey reused with different params (KEY_REUSE)
+  //   422 → REJECTED by Kite, MISSING_ACCOUNT_TOKEN, or KEY_REUSE
   //   502 → ERROR (never reached Kite, or unclassified)
   let statusCode = 502;
   if (result.success) {
     statusCode = 200;
+  } else if (result.errorCode === 'MISSING_ACCOUNT_TOKEN') {
+    statusCode = 422;
+  } else if (result.errorCode === 'TOKEN_INVALID') {
+    statusCode = 401;
   } else if (result.errorCode === 'KEY_REUSE') {
     // CRITICAL FIX (Bug #2): same key with different payload → 422.
     statusCode = 422;

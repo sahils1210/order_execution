@@ -33,6 +33,32 @@ export class KiteTimeoutError extends Error {
 }
 
 /**
+ * Thrown by OrderManager.kiteFor when STRICT_ACCOUNT_TOKENS is on and a
+ * non-master accountId arrives without a corresponding accountTokens entry.
+ * Mapped to HTTP 422 / errorCode MISSING_ACCOUNT_TOKEN at the route layer.
+ */
+export class MissingAccountTokenError extends Error {
+  constructor(public readonly accountId: string) {
+    super(`Account token required for non-master account '${accountId}' (accountTokens[${accountId}] missing)`);
+    this.name = 'MissingAccountTokenError';
+  }
+}
+
+/**
+ * Sentinel thrown inside placeWithPolicy when a Kite TOKEN error is
+ * classified for a NON-master account. We do NOT refresh the gateway-side
+ * token in this case — the caller (Scalper) is the authority for client
+ * tokens, so we surface a TOKEN_INVALID result and let Scalper force-refresh
+ * its TokenManager and retry on the next dispatch with a fresh idempotency key.
+ */
+export class TokenInvalidForNonMasterError extends Error {
+  constructor(public readonly accountId: string, public readonly originalMessage: string) {
+    super(`Provided account token rejected by Kite for account '${accountId}': ${originalMessage}`);
+    this.name = 'TokenInvalidForNonMasterError';
+  }
+}
+
+/**
  * Pull the salient fields off whatever the kiteconnect SDK or axios threw at us.
  * The SDK throws plain objects with `error_type` and `message`, axios errors carry
  * `response.status` and `code`. Node fetch errors carry `cause.code`.

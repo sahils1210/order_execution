@@ -53,6 +53,24 @@ export interface OrderRequest {
   price?: number;
   triggerPrice?: number;
   // NOTE: client-supplied `tag` is intentionally ignored — gateway owns the tag for reconciliation.
+
+  /**
+   * Optional per-account access tokens. When supplied, the gateway uses
+   * `accountTokens[accountId]` verbatim for THIS request only (per-request
+   * KiteConnect — no mutation of shared AccountRegistry sessions).
+   *
+   * Behaviour:
+   *   - If `accountTokens[accountId]` is set, it overrides the gateway's
+   *     internal token for that request.
+   *   - If absent and `accountId === 'master'`, the gateway falls back to
+   *     its own master kiteClient session.
+   *   - If absent and `accountId !== 'master'` AND
+   *     `STRICT_ACCOUNT_TOKENS=true`, the request is rejected with
+   *     HTTP 422 / `MISSING_ACCOUNT_TOKEN`.
+   *   - If absent, non-master, and STRICT is off, the gateway falls back to
+   *     the AccountRegistry token (legacy behaviour).
+   */
+  accountTokens?: Record<string, string>;
 }
 
 // ── Response to client ──────────────────────────────────────────────────────
