@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { orderManager } from '../oms/OrderManager.js';
 import { logger } from '../logger.js';
+import { httpStatusForErrorKind } from './httpStatusMap.js';
 
 // =========================================
 // DELETE /order/:orderId        — Cancel order (master account)
@@ -8,6 +9,24 @@ import { logger } from '../logger.js';
 //
 // Multi-account cancel/modify is intentionally not exposed yet — the broker
 // order_id is account-specific and there is no use case in the current callers.
+//
+// HTTP STATUS MAPPING (cancel/modify failures):
+//   The previous version returned a blanket 502 on any failure. That conflates
+//   "Kite refused this cancel" (legitimate, client-actionable) with "gateway
+//   couldn't reach Kite" (real outage). Callers that retry on 502 would then
+//   storm the gateway with cancels Kite has already terminally rejected — which
+//   is exactly the dup-cancel pattern observed in 100-ALGO on 2026-06-03.
+//
+//   The new mapping:
+//     409 Conflict       — broker refused (REJECTED, INPUT, PERMISSION, GENERAL)
+//                          → "order already cancelled", "not cancellable", etc.
+//                          Callers should NOT retry without changing inputs.
+//     401 Unauthorized   — TOKEN error
+//                          → token expired/invalid. Caller refreshes and retries.
+//     502 Bad Gateway    — TIMEOUT / CONNECT_FAILED / GATEWAY_5XX / MIDFLIGHT_RESET
+//                          → genuine upstream failure. Caller may retry with same
+//                          inputs after a backoff.
+//     400 Bad Request    — validation failures (no orderId, missing modify field)
 // =========================================
 
 export const orderActionsRouter = Router();
@@ -37,9 +56,11 @@ orderActionsRouter.delete('/:orderId', async (req: Request, res: Response): Prom
       latencyMs: result.latencyMs,
     });
   } else {
-    res.status(502).json({
+    const status = httpStatusForErrorKind(result.errorKind);
+    res.status(status).json({
       success: false,
       message: result.error,
+      errorKind: result.errorKind ?? null,
       latencyMs: result.latencyMs,
     });
   }
@@ -91,9 +112,11 @@ orderActionsRouter.patch('/:orderId', async (req: Request, res: Response): Promi
       latencyMs: result.latencyMs,
     });
   } else {
-    res.status(502).json({
+    const status = httpStatusForErrorKind(result.errorKind);
+    res.status(status).json({
       success: false,
       message: result.error,
+      errorKind: result.errorKind ?? null,
       latencyMs: result.latencyMs,
     });
   }

@@ -44,6 +44,13 @@ export interface CancellationResult {
   orderId: string | null;
   error: string | null;
   latencyMs: number;
+  /**
+   * When success=false, the classified error kind (e.g. 'REJECTED', 'TIMEOUT').
+   * Drives HTTP status mapping at the route layer: broker-rejected → 4xx,
+   * gateway-couldn't-reach-broker → 5xx. Null on success or pre-Kite failures
+   * (where we couldn't even call Kite — e.g. unknown account).
+   */
+  errorKind?: import('../kite/errors.js').KiteErrorKind | null;
 }
 
 const COMPOSITE_SEPARATOR = '::';
@@ -253,10 +260,10 @@ class OrderManager {
         () => callRaw(kite, 'cancelOrder', variety, orderId),
         config.kite.timeoutMs,
       );
-      return { success: true, orderId: cancelledId, error: null, latencyMs: Date.now() - startMs };
+      return { success: true, orderId: cancelledId, error: null, latencyMs: Date.now() - startMs, errorKind: null };
     } catch (err) {
       const c = classifyKiteError(err);
-      return cancelFail(`[${c.kind}] ${c.message}`, startMs);
+      return cancelFail(`[${c.kind}] ${c.message}`, startMs, c.kind);
     }
   }
 
@@ -291,10 +298,10 @@ class OrderManager {
         () => callRaw(kite, 'modifyOrder', variety, orderId, modifyParams),
         config.kite.timeoutMs,
       );
-      return { success: true, orderId: modifiedId, error: null, latencyMs: Date.now() - startMs };
+      return { success: true, orderId: modifiedId, error: null, latencyMs: Date.now() - startMs, errorKind: null };
     } catch (err) {
       const c = classifyKiteError(err);
-      return cancelFail(`[${c.kind}] ${c.message}`, startMs);
+      return cancelFail(`[${c.kind}] ${c.message}`, startMs, c.kind);
     }
   }
 
@@ -555,8 +562,12 @@ function fail(
   };
 }
 
-function cancelFail(message: string, startMs: number): CancellationResult {
-  return { success: false, orderId: null, error: message, latencyMs: Date.now() - startMs };
+function cancelFail(
+  message: string,
+  startMs: number,
+  errorKind: import('../kite/errors.js').KiteErrorKind | null = null,
+): CancellationResult {
+  return { success: false, orderId: null, error: message, latencyMs: Date.now() - startMs, errorKind };
 }
 
 function existingToResult(
