@@ -80,6 +80,13 @@ export interface OrderResponse {
   orderId?: string;
   message?: string;
   latencyMs: number;
+  /**
+   * Present and `true` when the gateway simulated the order instead of
+   * forwarding it to Kite. Set by dry-run mode (DRY_RUN_OUTSIDE_HOURS,
+   * activated only outside NSE session hours). Strategy MUST treat
+   * `orderId` as synthetic ("DRYRUN-...") and skip post-fill bookkeeping.
+   */
+  dryRun?: boolean;
 }
 
 // ── DB row shape ────────────────────────────────────────────────────────────

@@ -114,6 +114,17 @@ export const config = {
     bodyLimitBytes:       optInt('POSTBACK_BODY_LIMIT_BYTES', 32 * 1024),
   },
 
+  // ── Dry-run mode ────────────────────────────────────────────────────────
+  // When `outsideHours` is true AND NSE is closed (Mon–Fri 09:15–15:30 IST is
+  // "open"; everything else is closed including weekends), placeOrder skips
+  // the Kite call and returns a synthetic ACCEPTED with `kiteOrderId =
+  // "DRYRUN-..."` so strategies can validate their pair-matching logic
+  // without placing real orders. Inside market hours: ALWAYS live, regardless
+  // of the flag — the time check is the safety gate, not the flag.
+  dryRun: {
+    outsideHours: optBool('DRY_RUN_OUTSIDE_HOURS', false),
+  },
+
   // ── WebSocket (UI dashboard) ────────────────────────────────────────────
   ws: {
     /** Require X-API-Key (or `auth.apiKey`) on every Socket.IO connection. */

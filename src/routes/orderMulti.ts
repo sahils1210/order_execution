@@ -32,6 +32,8 @@ interface AccountResult {
   error?: string;
   latencyMs: number;
   cached: boolean;
+  /** True if this placement was simulated (dry-run mode). */
+  dryRun?: boolean;
 }
 
 orderMultiRouter.post('/', async (req: Request, res: Response): Promise<void> => {
@@ -97,6 +99,7 @@ orderMultiRouter.post('/', async (req: Request, res: Response): Promise<void> =>
       error: r.error ?? undefined,
       latencyMs: r.latencyMs,
       cached: r.cached,
+      ...(r.dryRun ? { dryRun: true } : {}),
     }];
   });
 

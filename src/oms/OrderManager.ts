@@ -19,6 +19,8 @@ import { circuitBreaker } from '../risk/CircuitBreaker.js';
 import { preTradeCheck } from '../risk/PreTradeCheck.js';
 import { emitOrderUpdate } from '../websocket.js';
 import { runtimeMetrics } from '../observability/runtimeMetrics.js';
+import { isMarketOpenIST } from '../utils/marketHours.js';
+import { randomBytes } from 'crypto';
 import type { OrderRequest, OrderStatus } from '../types.js';
 
 // =========================================
@@ -37,6 +39,12 @@ export interface PlacementResult {
   latencyMs: number;
   cached: boolean;
   errorCode?: 'KEY_REUSE' | 'MISSING_ACCOUNT_TOKEN' | 'TOKEN_INVALID';
+  /**
+   * True when the order was simulated (DRY_RUN_OUTSIDE_HOURS active +
+   * market closed). No Kite call was made; `orderId` is "DRYRUN-...".
+   * Strategies should observe this flag and treat the order as test-only.
+   */
+  dryRun?: boolean;
 }
 
 export interface CancellationResult {
@@ -77,6 +85,17 @@ class OrderManager {
     const pre = preTradeCheck.validate(req, accountId);
     if (!pre.ok) {
       return fail('ERROR', pre.reason ?? 'Pre-trade check failed', startMs);
+    }
+
+    // 3.5. DRY-RUN short-circuit.
+    //   Active only when BOTH:
+    //     - DRY_RUN_OUTSIDE_HOURS=true is set, AND
+    //     - NSE is currently closed (weekend OR weekday outside 09:15-15:30 IST)
+    //   Skips Kite entirely; writes a synthetic ACCEPTED row so the strategy
+    //   can verify pair-matching logic without placing real orders. Goes
+    //   through atomicCheckAndInsert so idempotency still works in test mode.
+    if (config.dryRun.outsideHours && !isMarketOpenIST()) {
+      return this.placeDryRun(req, accountId, compositeKey, startMs);
     }
 
     // 4. Resolve account (per-request token override if supplied)
@@ -241,11 +260,116 @@ class OrderManager {
     };
   }
 
+  // ─── Dry-run placement (no Kite call) ─────────────────────────────────────
+  /**
+   * Simulate an order placement WITHOUT calling Kite. Used by the dry-run
+   * mode gate in placeOrder(). Goes through the same atomic-insert path so
+   * idempotency still protects against duplicate test orders, then writes a
+   * synthetic ACCEPTED row with kiteOrderId="DRYRUN-<14 hex>".
+   *
+   * The strategy receives `dryRun: true` in the response and can use the
+   * returned orderId for subsequent cancel/modify calls (cancelOrder /
+   * modifyOrder recognise the "DRYRUN-" prefix and short-circuit).
+   *
+   * No Kite calls. No PositionManager updates (a real postback never
+   * arrives, so applyFill is never triggered — positions stay clean).
+   */
+  private async placeDryRun(
+    req: OrderRequest,
+    accountId: string,
+    compositeKey: string,
+    startMs: number,
+  ): Promise<PlacementResult> {
+    const tag = makeTag(req.idempotencyKey, accountId);
+    const variety = req.variety ?? 'regular';
+
+    let existing;
+    try {
+      existing = atomicCheckAndInsert({
+        clientIdempotencyKey: req.idempotencyKey,
+        accountId,
+        source: req.source,
+        exchange: req.exchange,
+        tradingsymbol: req.tradingsymbol,
+        transactionType: req.transactionType,
+        quantity: req.quantity,
+        product: req.product,
+        orderType: req.orderType,
+        variety,
+        price: req.price ?? null,
+        triggerPrice: req.triggerPrice ?? null,
+        tag,
+      });
+    } catch (err) {
+      if (err instanceof IdempotencyKeyReuseError) {
+        logger.error('Dry-run rejected: idempotencyKey reuse with different payload', {
+          accountId, idempotencyKey: req.idempotencyKey, symbol: req.tradingsymbol,
+        });
+        return fail('ERROR', err.message, startMs, 'KEY_REUSE');
+      }
+      throw err;
+    }
+
+    if (existing) {
+      // Cached dry-run retry — return same synthetic orderId.
+      const r = existingToResult(existing.status, existing.kiteOrderId, existing.errorMessage, startMs);
+      if (existing.kiteOrderId?.startsWith('DRYRUN-')) r.dryRun = true;
+      return r;
+    }
+
+    preTradeCheck.recordAdmitted(req.source);
+
+    const dryRunOrderId = `DRYRUN-${randomBytes(7).toString('hex')}`;
+    const latencyMs = Date.now() - startMs;
+
+    updateStatusByCompositeKey(compositeKey, {
+      status: 'ACCEPTED',
+      kiteOrderId: dryRunOrderId,
+      kiteResponse: JSON.stringify({ dryRun: true, simulatedAt: new Date().toISOString() }),
+      latencyMs,
+    });
+
+    logger.warn('Dry-run order accepted (gateway did NOT call Kite)', {
+      compositeKey, accountId, tag, dryRunOrderId,
+      symbol: req.tradingsymbol, side: req.transactionType, qty: req.quantity, source: req.source,
+    });
+
+    emitOrderUpdate({
+      idempotencyKey: req.idempotencyKey,
+      source: req.source,
+      tradingsymbol: req.tradingsymbol,
+      transactionType: req.transactionType,
+      quantity: req.quantity,
+      status: 'ACCEPTED',
+      kiteOrderId: dryRunOrderId,
+      errorMessage: null,
+      latencyMs,
+      receivedAt: new Date().toISOString(),
+    });
+
+    return {
+      success: true,
+      status: 'ACCEPTED',
+      orderId: dryRunOrderId,
+      error: null,
+      latencyMs,
+      cached: false,
+      dryRun: true,
+    };
+  }
+
   // ─── Cancel ───────────────────────────────────────────────────────────────
   // CRITICAL: cancellation is ALWAYS allowed, even when the kill switch is
   // engaged. Halting must never lock the operator out of reducing exposure.
   async cancelOrder(orderId: string, variety: string, accountId: string, tokenOverride?: string): Promise<CancellationResult> {
     const startMs = Date.now();
+
+    // Dry-run short-circuit: synthetic orderIds never reach Kite. This lets
+    // strategies cancel their own dry-run orders cleanly.
+    if (orderId.startsWith('DRYRUN-')) {
+      logger.warn('Dry-run cancel (no Kite call)', { orderId });
+      return { success: true, orderId, error: null, latencyMs: Date.now() - startMs, errorKind: null };
+    }
 
     let kite: Connect;
     try {
@@ -278,6 +402,12 @@ class OrderManager {
     tokenOverride?: string,
   ): Promise<CancellationResult> {
     const startMs = Date.now();
+
+    // Dry-run short-circuit: synthetic orderIds never reach Kite.
+    if (orderId.startsWith('DRYRUN-')) {
+      logger.warn('Dry-run modify (no Kite call)', { orderId, params });
+      return { success: true, orderId, error: null, latencyMs: Date.now() - startMs, errorKind: null };
+    }
 
     let kite: Connect;
     try {

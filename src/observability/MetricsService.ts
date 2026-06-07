@@ -24,10 +24,8 @@ import { kiteClient } from '../kite/KiteClient.js';
 // re-queried — keeps a /metrics call to ~5 ms even with thousands of orders.
 // =========================================
 
-// IST trading session (NSE) — used to gate the "no postbacks for 10m" alert
-// so it doesn't fire overnight or on weekends.
-const NSE_OPEN_IST_MIN  =  9 * 60 + 15; //  9:15
-const NSE_CLOSE_IST_MIN = 15 * 60 + 30; // 15:30
+import { isMarketOpenIST } from '../utils/marketHours.js';
+import { config } from '../config.js';
 
 export interface MetricsAlert {
   /** Stable id — UI can dedup repeated emissions. */
@@ -37,7 +35,8 @@ export interface MetricsAlert {
     | 'REPEATED_ERRORS'
     | 'POSTBACK_CONFLICT'
     | 'POSTBACK_INVALID_CHECKSUM'
-    | 'TOKEN_INVALID';
+    | 'TOKEN_INVALID'
+    | 'DRY_RUN_ACTIVE';
   level: 'info' | 'warn' | 'critical';
   message: string;
   /** Hint for the operator — what to look at next. */
@@ -241,18 +240,25 @@ class MetricsService {
       });
     }
 
+    // 7) Dry-run mode active — visible reminder so operator can see at a
+    //    glance "we're NOT placing real orders right now". Info-level only:
+    //    this is a configured state, not a fault. Does NOT fire Telegram
+    //    (Broadcaster filters info/warn).
+    if (config.dryRun.outsideHours && !this.isMarketOpenNow()) {
+      out.push({
+        id: 'DRY_RUN_ACTIVE',
+        level: 'info',
+        message: 'Dry-run mode is ACTIVE — orders are simulated, no Kite calls',
+        hint: 'DRY_RUN_OUTSIDE_HOURS=true and market is closed. Orders return synthetic ACCEPTED with kiteOrderId="DRYRUN-...". This automatically deactivates at next market open (Mon–Fri 09:15 IST).',
+      });
+    }
+
     return out;
   }
 
-  /** True iff current IST time is within the NSE 9:15–15:30 window on a weekday. */
+  /** Delegates to the shared utility — kept as a method for API stability. */
   isMarketOpenNow(now: Date = new Date()): boolean {
-    // IST = UTC+5:30
-    const ist = new Date(now.getTime() + 5.5 * 3600 * 1000);
-    // getUTC* on the shifted date is effectively "in IST".
-    const dow = ist.getUTCDay();           // 0=Sun, 6=Sat
-    if (dow === 0 || dow === 6) return false;
-    const minutes = ist.getUTCHours() * 60 + ist.getUTCMinutes();
-    return minutes >= NSE_OPEN_IST_MIN && minutes <= NSE_CLOSE_IST_MIN;
+    return isMarketOpenIST(now);
   }
 }
 

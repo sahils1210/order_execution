@@ -25,6 +25,7 @@ orderRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     orderId: result.orderId ?? undefined,
     message: result.error ?? undefined,
     latencyMs: result.latencyMs,
+    ...(result.dryRun ? { dryRun: true } : {}),
   };
 
   // HTTP semantics:
