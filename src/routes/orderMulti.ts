@@ -34,6 +34,8 @@ interface AccountResult {
   cached: boolean;
   /** True if this placement was simulated (dry-run mode). */
   dryRun?: boolean;
+  /** True if regular order was rejected and retried as AMO. */
+  amoFallback?: boolean;
 }
 
 orderMultiRouter.post('/', async (req: Request, res: Response): Promise<void> => {
@@ -100,6 +102,7 @@ orderMultiRouter.post('/', async (req: Request, res: Response): Promise<void> =>
       latencyMs: r.latencyMs,
       cached: r.cached,
       ...(r.dryRun ? { dryRun: true } : {}),
+      ...(r.amoFallback ? { amoFallback: true } : {}),
     }];
   });
 

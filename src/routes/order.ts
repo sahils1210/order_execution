@@ -26,6 +26,7 @@ orderRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     message: result.error ?? undefined,
     latencyMs: result.latencyMs,
     ...(result.dryRun ? { dryRun: true } : {}),
+    ...(result.amoFallback ? { amoFallback: true } : {}),
   };
 
   // HTTP semantics:

@@ -114,6 +114,26 @@ export const config = {
     bodyLimitBytes:       optInt('POSTBACK_BODY_LIMIT_BYTES', 32 * 1024),
   },
 
+  // ── AMO fallback on market-closed rejection ─────────────────────────────
+  // When TRUE *and* mode is LIVE (not dry-run): if Kite rejects a regular
+  // order with the "markets not open / try AMO" signature, OrderManager
+  // transparently retries the same order with variety='amo'. The Kite order
+  // then queues for the next session's open.
+  //
+  // Default FALSE. **Real-money implication**: an AMO order queued on
+  // Sunday WILL execute Monday 9:15 IST if its limit price is achievable.
+  // Only enable when the operator wants this behaviour and accepts that
+  // tradeoff (e.g. for a strategy that explicitly wants post-market
+  // exposure when blocked).
+  //
+  // The detector triggers ONLY on Kite's literal "try placing an AMO order"
+  // suggestion (and a couple of safe variants) — see oms/amoFallback.ts.
+  // Generic rejections (margin, expiry, permissions) never trigger the
+  // fallback.
+  amoFallback: {
+    onMarketClosed: optBool('AMO_FALLBACK_ON_MARKET_CLOSED', false),
+  },
+
   // ── Dry-run mode ────────────────────────────────────────────────────────
   // When `outsideHours` is true AND NSE is closed (Mon–Fri 09:15–15:30 IST is
   // "open"; everything else is closed including weekends), placeOrder skips

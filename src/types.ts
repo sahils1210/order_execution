@@ -87,6 +87,14 @@ export interface OrderResponse {
    * `orderId` as synthetic ("DRYRUN-...") and skip post-fill bookkeeping.
    */
   dryRun?: boolean;
+  /**
+   * Present and `true` when the original regular-variety placement was
+   * rejected by Kite (market closed) and the gateway transparently retried
+   * as variety='amo'. The orderId/status reflect the AMO outcome. The
+   * order will execute at the next session's open if its limit price is
+   * achievable — strategy should treat as a real position commitment.
+   */
+  amoFallback?: boolean;
 }
 
 // ── DB row shape ────────────────────────────────────────────────────────────

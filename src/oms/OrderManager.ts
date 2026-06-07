@@ -20,6 +20,8 @@ import { preTradeCheck } from '../risk/PreTradeCheck.js';
 import { tradingMode } from '../risk/TradingMode.js';
 import { emitOrderUpdate } from '../websocket.js';
 import { runtimeMetrics } from '../observability/runtimeMetrics.js';
+import { alertAsync } from '../alerts/Telegram.js';
+import { isMarketClosedRejection } from './amoFallback.js';
 import { randomBytes } from 'crypto';
 import type { OrderRequest, OrderStatus } from '../types.js';
 
@@ -45,6 +47,13 @@ export interface PlacementResult {
    * Strategies should observe this flag and treat the order as test-only.
    */
   dryRun?: boolean;
+  /**
+   * True when the original variety was rejected by Kite with the
+   * market-closed signature and the gateway transparently retried as
+   * variety='amo' (AMO_FALLBACK_ON_MARKET_CLOSED must be on). The
+   * orderId / status reflect the AMO outcome, NOT the original attempt.
+   */
+  amoFallback?: boolean;
 }
 
 export interface CancellationResult {
@@ -158,6 +167,7 @@ class OrderManager {
     let finalStatus: OrderStatus = 'ERROR';
     let errorMessage: string | null = null;
     let nonMasterTokenInvalid = false;
+    let amoFallback = false;
 
     try {
       orderId = await this.placeWithPolicy(kite, accountId, variety, params, tag, compositeKey);
@@ -185,7 +195,37 @@ class OrderManager {
           circuitBreaker.recordError(req.source, req.tradingsymbol);
           autoHaltMonitor.recordError();
         } else if (c.kind === 'INPUT') {
-          finalStatus = 'ERROR';
+          // AMO fallback (opt-in, real-money capable).
+          //   - Only fires when AMO_FALLBACK_ON_MARKET_CLOSED=true.
+          //   - Only fires on the literal "try placing an AMO order" Kite
+          //     suggestion (see oms/amoFallback.ts) — never on generic
+          //     INPUT errors like wrong tick size, expired contract, etc.
+          //   - Only fires when the original variety was NOT already 'amo'
+          //     (no infinite retry loop).
+          //   - Attempted exactly once.
+          if (
+            config.amoFallback.onMarketClosed &&
+            variety !== 'amo' &&
+            isMarketClosedRejection(c.message)
+          ) {
+            const amoOutcome = await this.tryAmoFallback(
+              kite, accountId, params, tag, compositeKey, c.message, req,
+            );
+            if (amoOutcome.ok) {
+              orderId = amoOutcome.orderId;
+              finalStatus = 'ACCEPTED';
+              errorMessage = null;
+              amoFallback = true;
+              circuitBreaker.recordSuccess(req.source, req.tradingsymbol);
+              autoHaltMonitor.recordSuccess();
+              runtimeMetrics.recordKiteCallSuccess();
+            } else {
+              finalStatus = 'ERROR';
+              errorMessage = amoOutcome.error;
+            }
+          } else {
+            finalStatus = 'ERROR';
+          }
         } else {
           finalStatus = 'ERROR';
           circuitBreaker.recordError(req.source, req.tradingsymbol);
@@ -221,10 +261,13 @@ class OrderManager {
         kiteOrderId: orderId,
       });
     } else {
+      const kiteResponseBody = orderId
+        ? JSON.stringify({ order_id: orderId, ...(amoFallback ? { amoFallback: true } : {}) })
+        : null;
       updateStatusByCompositeKey(compositeKey, {
         status: finalStatus,
         kiteOrderId: orderId,
-        kiteResponse: orderId ? JSON.stringify({ order_id: orderId }) : null,
+        kiteResponse: kiteResponseBody,
         errorMessage,
         latencyMs,
       });
@@ -243,7 +286,7 @@ class OrderManager {
     }
 
     if (finalStatus === 'ACCEPTED' || finalStatus === 'COMPLETE') {
-      logger.info('Order finalised', { compositeKey, accountId, tag, status: finalStatus, orderId, latencyMs });
+      logger.info('Order finalised', { compositeKey, accountId, tag, status: finalStatus, orderId, latencyMs, ...(amoFallback ? { amoFallback: true } : {}) });
     } else if (finalStatus === 'UNKNOWN') {
       logger.warn('Order UNKNOWN — reconciliation scheduled', { compositeKey, accountId, tag, latencyMs });
     } else {
@@ -259,6 +302,7 @@ class OrderManager {
       latencyMs,
       cached: false,
       ...(nonMasterTokenInvalid ? { errorCode: 'TOKEN_INVALID' as const } : {}),
+      ...(amoFallback ? { amoFallback: true } : {}),
     };
   }
 
@@ -480,6 +524,48 @@ class OrderManager {
       await kiteClient.refreshToken();
     } else {
       await accountRegistry.refreshAccount(accountId);
+    }
+  }
+
+  /**
+   * Re-place the order with variety='amo' after a market-closed rejection.
+   * Returns the AMO order_id on success, or a propagated error string on
+   * failure. Emits warn-level log + Telegram alert so the operator can see
+   * the conversion is happening (real-money implication: order is queued
+   * at Kite and WILL execute at next session open if achievable).
+   */
+  private async tryAmoFallback(
+    kite: Connect,
+    accountId: string,
+    params: Record<string, unknown>,
+    tag: string,
+    compositeKey: string,
+    originalMessage: string,
+    req: OrderRequest,
+  ): Promise<{ ok: true; orderId: string } | { ok: false; error: string }> {
+    logger.warn('AMO fallback: regular order rejected as market-closed — retrying as AMO', {
+      compositeKey, accountId, tag, originalMessage,
+      symbol: req.tradingsymbol, side: req.transactionType, qty: req.quantity, source: req.source,
+    });
+    try {
+      const amoOrderId = await this.placeWithPolicy(kite, accountId, 'amo', params, tag, compositeKey);
+      logger.warn('AMO fallback succeeded — order queued at Kite', {
+        compositeKey, accountId, tag, amoOrderId, source: req.source,
+      });
+      alertAsync(
+        'warn',
+        'AMO fallback used',
+        `Symbol: ${req.tradingsymbol}\nSide: ${req.transactionType}\nQty: ${req.quantity}\nSource: ${req.source}\nOriginal rejection: ${originalMessage}\n\nAMO Kite order_id: ${amoOrderId}\n\nThis order is now queued at Kite and WILL execute at the next session open if its limit price is achievable.`,
+      );
+      return { ok: true, orderId: amoOrderId };
+    } catch (err) {
+      const c2 = classifyKiteError(err);
+      const errorMessage = `[${c2.kind}] ${c2.message} (AMO fallback also failed)`;
+      logger.error('AMO fallback failed — both regular and AMO rejected by Kite', {
+        compositeKey, accountId, tag, error: errorMessage,
+      });
+      runtimeMetrics.recordKiteCallError(`AMO_FALLBACK_FAIL ${c2.kind}: ${c2.message}`);
+      return { ok: false, error: errorMessage };
     }
   }
 
