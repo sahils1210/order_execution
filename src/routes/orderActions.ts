@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { orderManager } from '../oms/OrderManager.js';
 import { logger } from '../logger.js';
 import { httpStatusForErrorKind } from './httpStatusMap.js';
+import { buildStatusResponse } from './orderStatusMap.js';
+import { findByKiteOrderId } from '../db/database.js';
 
 // =========================================
 // DELETE /order/:orderId        — Cancel order (master account)
@@ -30,6 +32,47 @@ import { httpStatusForErrorKind } from './httpStatusMap.js';
 // =========================================
 
 export const orderActionsRouter = Router();
+
+// ─── GET /order/:orderId ────────────────────────────────────────────────────
+// Returns a Kite-orderHistory-shaped array describing the gateway's view of
+// the order. Designed to be a drop-in for callers that currently poll
+// `kite.orderHistory(order_id)`:
+//
+//   * For DRYRUN-* IDs: synthesises a single COMPLETE element so strategies
+//     in dry-run mode can confirm "fills" without Kite ever seeing the ID.
+//     Without this, strategies place orders, get back DRYRUN-..., poll Kite,
+//     and Kite returns "Invalid order_id" — making every dry-run leg appear
+//     to fail to verify. (See SST/CNN smoke test on 2026-06-07.)
+//
+//   * For real Kite IDs known to the gateway: returns the gateway's DB-
+//     known state mapped to Kite's status vocabulary. Callers that need
+//     full trade-tick detail should still go to Kite directly.
+//
+//   * For unknown IDs: 404.
+//
+// Always returns 200 with a JSON ARRAY on success (matching Kite's contract),
+// even though we only ever return one element. The `dryRun` field on each
+// element lets consumers distinguish synthetic from real without parsing the
+// order_id prefix.
+orderActionsRouter.get('/:orderId', (req: Request, res: Response): void => {
+  const { orderId } = req.params;
+  if (!orderId || typeof orderId !== 'string' || orderId.trim() === '') {
+    res.status(400).json({ success: false, message: 'orderId path param is required' });
+    return;
+  }
+
+  const row = findByKiteOrderId(orderId.trim());
+  if (!row) {
+    res.status(404).json({
+      success: false,
+      message: `Order not found in gateway DB: ${orderId}`,
+      orderId,
+    });
+    return;
+  }
+
+  res.status(200).json(buildStatusResponse(row));
+});
 
 // ─── DELETE /order/:orderId ─────────────────────────────────────────────────
 orderActionsRouter.delete('/:orderId', async (req: Request, res: Response): Promise<void> => {
