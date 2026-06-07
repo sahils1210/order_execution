@@ -208,6 +208,23 @@ function runMigrations(): void {
       WHERE postback_event_id IS NOT NULL;
   `);
   recordVersion(5);
+
+  // v6: trading mode (live / dry-run) — operator-facing runtime toggle
+  // Single-row table mirroring kill_switch pattern. Default 'live' on first
+  // boot so an empty DB never accidentally suppresses Kite calls. Persists
+  // across restart — operator MUST explicitly switch back to 'live' after
+  // testing. (Per Design B: no auto-revert at market open.)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS trading_mode (
+      id          INTEGER PRIMARY KEY CHECK (id = 1),
+      mode        TEXT    NOT NULL DEFAULT 'live' CHECK (mode IN ('live','dry-run')),
+      reason      TEXT,
+      source      TEXT,
+      updated_at  TEXT
+    );
+  `);
+  db.exec(`INSERT OR IGNORE INTO trading_mode (id, mode) VALUES (1, 'live');`);
+  recordVersion(6);
 }
 
 function ensureColumn(table: string, column: string, definition: string): void {
@@ -806,6 +823,32 @@ export function setKillSwitch(halted: boolean, reason: string | null, source: st
   db.prepare(`
     UPDATE kill_switch SET halted = ?, reason = ?, source = ?, updated_at = ? WHERE id = 1
   `).run(halted ? 1 : 0, reason, source, new Date().toISOString());
+}
+
+// ─── Trading mode (live / dry-run) ──────────────────────────────────────────
+export type TradingMode = 'live' | 'dry-run';
+
+export interface TradingModeRow {
+  mode: TradingMode;
+  reason: string | null;
+  source: string | null;
+  updatedAt: string | null;
+}
+
+export function getTradingMode(): TradingModeRow {
+  const row = db.prepare('SELECT mode, reason, source, updated_at FROM trading_mode WHERE id = 1').get() as
+    | { mode: string; reason: string | null; source: string | null; updated_at: string | null }
+    | undefined;
+  if (!row) return { mode: 'live', reason: null, source: null, updatedAt: null };
+  // Defensive: if the row was tampered, fall back to 'live' (safe default)
+  const mode: TradingMode = row.mode === 'dry-run' ? 'dry-run' : 'live';
+  return { mode, reason: row.reason, source: row.source, updatedAt: row.updated_at };
+}
+
+export function setTradingMode(mode: TradingMode, reason: string | null, source: string | null): void {
+  db.prepare(`
+    UPDATE trading_mode SET mode = ?, reason = ?, source = ?, updated_at = ? WHERE id = 1
+  `).run(mode, reason, source, new Date().toISOString());
 }
 
 // ─── Positions ──────────────────────────────────────────────────────────────

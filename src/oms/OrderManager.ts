@@ -17,9 +17,9 @@ import { makeTag } from './tag.js';
 import { killSwitch, autoHaltMonitor } from '../risk/KillSwitch.js';
 import { circuitBreaker } from '../risk/CircuitBreaker.js';
 import { preTradeCheck } from '../risk/PreTradeCheck.js';
+import { tradingMode } from '../risk/TradingMode.js';
 import { emitOrderUpdate } from '../websocket.js';
 import { runtimeMetrics } from '../observability/runtimeMetrics.js';
-import { isMarketOpenIST } from '../utils/marketHours.js';
 import { randomBytes } from 'crypto';
 import type { OrderRequest, OrderStatus } from '../types.js';
 
@@ -88,13 +88,15 @@ class OrderManager {
     }
 
     // 3.5. DRY-RUN short-circuit.
-    //   Active only when BOTH:
-    //     - DRY_RUN_OUTSIDE_HOURS=true is set, AND
-    //     - NSE is currently closed (weekend OR weekday outside 09:15-15:30 IST)
+    //   Active when EITHER:
+    //     (a) operator set tradingMode to 'dry-run' via /admin/mode (Design B
+    //         binary toggle — persists across restart, no auto-revert), OR
+    //     (b) DRY_RUN_OUTSIDE_HOURS=true is set AND NSE is currently closed
+    //         (legacy env-driven path with time gate)
     //   Skips Kite entirely; writes a synthetic ACCEPTED row so the strategy
     //   can verify pair-matching logic without placing real orders. Goes
     //   through atomicCheckAndInsert so idempotency still works in test mode.
-    if (config.dryRun.outsideHours && !isMarketOpenIST()) {
+    if (tradingMode.isDryRunActive()) {
       return this.placeDryRun(req, accountId, compositeKey, startMs);
     }
 

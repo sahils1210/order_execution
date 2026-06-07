@@ -58,3 +58,15 @@ export interface Filters {
   from: string;
   to: string;
 }
+
+export type TradingMode = 'live' | 'dry-run';
+
+export interface TradingModeStatus {
+  mode: TradingMode;
+  effectiveActive: boolean;
+  envFlag: boolean;
+  marketOpen: boolean;
+  reason: string | null;
+  source: string | null;
+  updatedAt: string | null;
+}

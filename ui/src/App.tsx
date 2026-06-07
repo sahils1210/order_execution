@@ -2,11 +2,16 @@ import React, { useState, useEffect } from 'react';
 import { OrderTable } from './components/OrderTable';
 import { FilterBar } from './components/Filters';
 import { TokenPanel } from './components/TokenPanel';
+import { TradingModePanel } from './components/TradingModePanel';
 import { useOrders } from './hooks/useOrders';
 import type { Filters } from './types';
 
 function App() {
-  const { orders, health, loading, wsConnected, fetchOrders, refreshToken, refreshing, refreshMsg } = useOrders();
+  const {
+    orders, health, loading, wsConnected,
+    fetchOrders, refreshToken, refreshing, refreshMsg,
+    mode, modeChanging, setTradingMode,
+  } = useOrders();
 
   const [filters, setFilters] = useState<Filters>({ source: '', status: '', from: '', to: '' });
 
@@ -33,6 +38,17 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-mono">
+
+      {/* ── DRY-RUN banner — always-on when mode is dry-run ────────── */}
+      {mode?.effectiveActive && (
+        <div className="bg-yellow-800/70 border-b border-yellow-600 px-6 py-2 flex items-center gap-3">
+          <span className="text-base">🧪</span>
+          <span className="text-sm text-yellow-100 font-medium">
+            DRY-RUN MODE ACTIVE — orders are simulated, NO Kite calls.
+            {mode.mode === 'dry-run' && mode.marketOpen && ' (Operator override during market hours.)'}
+          </span>
+        </div>
+      )}
 
       {/* ── Critical alert banner — shown when Kite is disconnected ── */}
       {isDown && (
@@ -97,6 +113,9 @@ function App() {
           refreshing={refreshing}
           refreshMsg={refreshMsg}
         />
+
+        {/* ── Trading Mode Panel (Design B binary toggle) ── */}
+        <TradingModePanel mode={mode} changing={modeChanging} onChange={setTradingMode} />
 
         {/* ── Stats Row ── */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

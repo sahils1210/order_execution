@@ -7,6 +7,8 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 import { initDb, getPostbackBootSnapshot } from './db/database.js';
 import { runtimeMetrics } from './observability/runtimeMetrics.js';
+import { tradingMode } from './risk/TradingMode.js';
+import { emitModeUpdate } from './websocket.js';
 import { kiteClient } from './kite/KiteClient.js';
 import { accountRegistry, parseAccountDefs } from './kite/AccountRegistry.js';
 import { initWebSocket, emitTokenStatus } from './websocket.js';
@@ -29,6 +31,7 @@ import { alertAsync } from './alerts/Telegram.js';
 async function main(): Promise<void> {
   initDb();
   killSwitch.initialize();
+  tradingMode.initialize();
   positionManager.recoverOnStartup();
 
   // Seed in-process postback counter so the first metrics tick after a mid-day
@@ -104,6 +107,10 @@ async function main(): Promise<void> {
 
   kiteClient.emitStatusUpdate = () => {
     emitTokenStatus(kiteClient.getTokenStatus());
+  };
+
+  tradingMode.emitStatusUpdate = () => {
+    emitModeUpdate(tradingMode.getStatus());
   };
 
   server.listen(config.port, () => {

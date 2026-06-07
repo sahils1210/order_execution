@@ -1,6 +1,14 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { io, Socket } from 'socket.io-client';
-import type { OrderLog, OrderUpdateEvent, HealthStatus, Filters, TokenStatus } from '../types';
+import type {
+  OrderLog,
+  OrderUpdateEvent,
+  HealthStatus,
+  Filters,
+  TokenStatus,
+  TradingMode,
+  TradingModeStatus,
+} from '../types';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 const API_KEY = import.meta.env.VITE_GATEWAY_API_KEY || '';
@@ -15,6 +23,8 @@ export function useOrders() {
   const [wsConnected, setWsConnected] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [refreshMsg, setRefreshMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [mode, setMode] = useState<TradingModeStatus | null>(null);
+  const [modeChanging, setModeChanging] = useState(false);
   const socketRef = useRef<Socket | null>(null);
 
   // ── Fetch orders ─────────────────────────────────────────────────────────
@@ -41,9 +51,20 @@ export function useOrders() {
   }, []);
 
   // ── Fetch health ─────────────────────────────────────────────────────────
+  // /health was split into /health/live (public) and /health/full (auth) in
+  // commit 5dd1900. Use /health/full for the dashboard — it carries kite,
+  // token, accounts, and risk state.
   const fetchHealth = useCallback(async () => {
     try {
-      const res = await fetch(`${API_URL}/health`);
+      const res = await fetch(`${API_URL}/health/full`, {
+        headers: { 'X-API-Key': API_KEY },
+      });
+      if (!res.ok) {
+        // Treat any non-2xx (incl. 401/404) as degraded so the banner is
+        // honest instead of silently overwriting state with garbage JSON.
+        setHealth((h) => ({ ...h, status: 'degraded', kiteConnected: false }));
+        return;
+      }
       const data = await res.json() as HealthStatus;
       setHealth(data);
     } catch {
@@ -120,7 +141,43 @@ export function useOrders() {
       setHealth((h) => ({ ...h, token: status, kiteConnected: status.valid }));
     });
 
+    // Real-time trading-mode status (live ↔ dry-run toggle from any client)
+    socket.on('mode:update', (status: TradingModeStatus) => {
+      setMode(status);
+    });
+
     return () => { socket.disconnect(); };
+  }, []);
+
+  // ── Trading mode (Design B binary toggle) ────────────────────────────────
+  const fetchMode = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_URL}/admin/mode`, {
+        headers: { 'X-API-Key': API_KEY },
+      });
+      if (!res.ok) return;
+      const data = await res.json() as TradingModeStatus;
+      setMode(data);
+    } catch { /* swallow — next tick will retry */ }
+  }, []);
+
+  /** Switch trading mode. Caller is responsible for confirming the action. */
+  const setTradingMode = useCallback(async (next: TradingMode, reason: string): Promise<{ ok: boolean; message?: string }> => {
+    setModeChanging(true);
+    try {
+      const res = await fetch(`${API_URL}/admin/mode`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-API-Key': API_KEY },
+        body: JSON.stringify({ mode: next, reason }),
+      });
+      const data = await res.json() as { ok: boolean; status?: TradingModeStatus; message?: string };
+      if (data.status) setMode(data.status);
+      return { ok: data.ok, message: data.message };
+    } catch (err) {
+      return { ok: false, message: String(err) };
+    } finally {
+      setModeChanging(false);
+    }
   }, []);
 
   // ── Health polling every 15s ──────────────────────────────────────────────
@@ -130,5 +187,14 @@ export function useOrders() {
     return () => clearInterval(interval);
   }, [fetchHealth]);
 
-  return { orders, health, loading, wsConnected, fetchOrders, refreshToken, refreshing, refreshMsg };
+  // ── Initial fetch for trading mode (subsequent updates flow via WS) ──────
+  useEffect(() => {
+    fetchMode();
+  }, [fetchMode]);
+
+  return {
+    orders, health, loading, wsConnected,
+    fetchOrders, refreshToken, refreshing, refreshMsg,
+    mode, modeChanging, setTradingMode,
+  };
 }

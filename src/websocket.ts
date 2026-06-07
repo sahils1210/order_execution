@@ -125,3 +125,8 @@ export function emitDiagnosticsUpdate(event: unknown): void {
   if (!io) return;
   io.emit('diagnostics:update', event);
 }
+
+export function emitModeUpdate(event: unknown): void {
+  if (!io) return;
+  io.emit('mode:update', event);
+}
